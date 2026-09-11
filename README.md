@@ -91,7 +91,7 @@
 ### 1. DSH 插件：GitHub 直装（推荐）
 
 ```sh
-dsh plugin --profile demo add github:tongwoojun/dsh-ntfy-remote
+dsh plugin --profile dsh-ntfy-remote add github:tongwoojun/dsh-ntfy-remote
 ```
 
 **不需要手改任何补丁文件。** `dsh plugin` 会在 profile 目录里跑 `pnpm add`，然后按
@@ -99,7 +99,7 @@ dsh plugin --profile demo add github:tongwoojun/dsh-ntfy-remote
 （本包的 `cordis.patch.yml` 就是），它就被自动追加进层栈：
 
 ```jsonc
-// $DSH_HOME/profiles/demo/package.json
+// $DSH_HOME/profiles/dsh-ntfy-remote/package.json
 {
   "dependencies": { "dsh-ntfy-remote": "github:tongwoojun/dsh-ntfy-remote" },
   "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-ntfy-remote"] } }
@@ -109,14 +109,14 @@ dsh plugin --profile demo add github:tongwoojun/dsh-ntfy-remote
 生产环境建议**锁定 tag**，避免上游改动直接影响你：
 
 ```sh
-dsh plugin --profile demo add github:tongwoojun/dsh-ntfy-remote#v1.0.0
+dsh plugin --profile dsh-ntfy-remote add github:tongwoojun/dsh-ntfy-remote#v1.0.0
 ```
 
 升级 / 卸载：
 
 ```sh
-dsh plugin --profile demo update dsh-ntfy-remote
-dsh plugin --profile demo remove dsh-ntfy-remote   # 会自动从 bundles 里移除
+dsh plugin --profile dsh-ntfy-remote update dsh-ntfy-remote
+dsh plugin --profile dsh-ntfy-remote remove dsh-ntfy-remote   # 会自动从 bundles 里移除
 ```
 
 > **profile 名换成你自己的**（`web`、`headless`……）。先建的 profile 用 `dsh plugin`
@@ -132,7 +132,7 @@ dsh plugin --profile demo remove dsh-ntfy-remote   # 会自动从 bundles 里移
 
 ```sh
 # 直接装进 profile（同样自动加入 bundles）
-dsh plugin --profile demo add dsh-ntfy-remote
+dsh plugin --profile dsh-ntfy-remote add dsh-ntfy-remote
 
 # 或作为普通依赖装进你自己的工程
 npm i dsh-ntfy-remote
@@ -141,7 +141,7 @@ npm i dsh-ntfy-remote
 ### 3. 本地路径（开发）
 
 ```sh
-dsh plugin --profile demo add /绝对路径/dsh-ntfy-remote
+dsh plugin --profile dsh-ntfy-remote add /绝对路径/dsh-ntfy-remote
 ```
 
 pnpm 以 `link:` 方式链接，改完源码热重载即时生效（见下面的外壳说明）。
