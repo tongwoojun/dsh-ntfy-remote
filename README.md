@@ -387,7 +387,7 @@ npm publish --dry-run  # 确认 tag=latest、access=public、没有被 private �
 
 ```sh
 npm view dsh-ntfy-remote version dist.tarball
-dsh plugin --profile dsh-ntfy-remote add dsh-ntfy-remote   # 从 npm 真装一次
+dsh plugin --profile web add dsh-ntfy-remote   # 从 npm 真装一次
 ```
 
 - `package.json` 的 `private` 必须为假（本包已去掉），否则 `npm publish` 直接拒绝。
