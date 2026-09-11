@@ -15,4 +15,7 @@
 **界面**：会话头部 `● ntfy` 按钮（就地选服务器、开关、改偏好）；设置 → ntfy remote
 （服务器增删改、全局默认偏好、所有会话总览）；以及独立状态页 `/dsh-ntfy-remote`。
 **生命周期**：会话被删除后自动断开桥接，不留僵尸订阅。
+**安装**：`dsh plugin --profile <p> add github:tongwoojun/dsh-ntfy-remote`（GitHub 直装，
+装完自动加入 profile 的 `dsh.profile.bundles`，无需手改补丁）、`dsh plugin … add
+dsh-ntfy-remote`（npm）、或本地路径。无构建步骤，包已可直接 `npm publish`。
 **数据**：`$DSH_HOME/dsh-ntfy-remote/{config.json,state.json,plugin.log}`，JSON 原子写入。

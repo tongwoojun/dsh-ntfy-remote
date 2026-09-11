@@ -83,33 +83,90 @@
 浏览器半边由 `node probe/client-check.mjs` 做桩冒烟测试（模块体执行、
 导出、两个槽位注册、按钮排序与几何）。
 
-## 挂载
+## 安装
 
-两条路径，二选一：
+三种方式，任选其一；装完刷新页面（客户端 bundle 会自动换 rev），然后在 DSH 输入框里
+敲 `/ntfy on`。前提：`pnpm` 在 PATH 上（`dsh plugin` 是它的转发器；缺失时会提示）。
 
-**装包（常规）**：把本包装进 profile，例如
-`dsh plugin --profile web add /绝对路径/dsh-ntfy-remote`，并让 profile 的 `package.json`
-里 `dsh.profile.bundles` 列出 `dsh-ntfy-remote`。仓库自带的 `cordis.patch.yml` 就按
-**包名**挂载：
+### 1. DSH 插件：GitHub 直装（推荐）
 
-```yaml
-- insert:
-    - id: dsh-ntfy-remote
-      name: dsh-ntfy-remote
+```sh
+dsh plugin --profile demo add github:tongwoojun/dsh-ntfy-remote
 ```
 
-**开发期快速试用**：不装包，直接在 web profile 的补丁层写 `boot3.js` 的**绝对路径**
-（开发期自热重载外壳）：
+**不需要手改任何补丁文件。** `dsh plugin` 会在 profile 目录里跑 `pnpm add`，然后按
+**安装后的状态**核对 `dsh.profile.bundles`：只要这个包声明了 `dsh.bundle.patch`
+（本包的 `cordis.patch.yml` 就是），它就被自动追加进层栈：
+
+```jsonc
+// $DSH_HOME/profiles/demo/package.json
+{
+  "dependencies": { "dsh-ntfy-remote": "github:tongwoojun/dsh-ntfy-remote" },
+  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-ntfy-remote"] } }
+}
+```
+
+生产环境建议**锁定 tag**，避免上游改动直接影响你：
+
+```sh
+dsh plugin --profile demo add github:tongwoojun/dsh-ntfy-remote#v1.0.0
+```
+
+升级 / 卸载：
+
+```sh
+dsh plugin --profile demo update dsh-ntfy-remote
+dsh plugin --profile demo remove dsh-ntfy-remote   # 会自动从 bundles 里移除
+```
+
+> **profile 名换成你自己的**（`web`、`headless`……）。先建的 profile 用 `dsh plugin`
+> 会自动初始化一个 base-backed profile。`web` 模板是 `patchReload: live`（改配置即时生效），
+> 其它随附模板只在启动时应用补丁，需重启。
+
+> 本包**没有构建步骤**（纯 ESM，客户端 bundle 是手写的），所以 git 安装不会触发 pnpm 的
+> `prepare` 构建拦截，也不需要 `allowBuilds` 白名单。
+
+### 2. npm
+
+```sh
+# 直接装进 profile（同样自动加入 bundles）
+dsh plugin --profile demo add dsh-ntfy-remote
+
+# 或作为普通依赖装进你自己的工程
+npm i dsh-ntfy-remote
+```
+
+### 3. 本地路径（开发）
+
+```sh
+dsh plugin --profile demo add /绝对路径/dsh-ntfy-remote
+```
+
+pnpm 以 `link:` 方式链接，改完源码热重载即时生效（见下面的外壳说明）。
+
+### 手动挂载（可选）
+
+不想用 CLI 时，也可以直接往 profile 的补丁层插一条，按**包名**引用本包
+（仓库自带 `cordis.patch.yml` 就是这么写的）：
 
 ```yaml
 # ~/.dsh/profiles/<profile>/cordis.patch.yml
 - insert:
     - id: dsh-ntfy-remote
+      name: dsh-ntfy-remote
+```
+
+不装包、只想快速试一下，则写 `boot3.js` 的**绝对路径**：
+
+```yaml
+- insert:
+    - id: dsh-ntfy-remote
       name: '/绝对路径/dsh-ntfy-remote/boot3.js'
 ```
 
-两种方式下补丁文件都被 DSH 监视（profile 的 `patchReload: live`），**改动即时挂载，
-不需要重启 dsh web**。注意：只有增删条目这类**有效配置变化**才会触发重载，改注释不会。
+补丁文件被 DSH 监视（profile 的 `patchReload: live`），**改动即时挂载，不需要重启
+dsh web**。注意：只有增删条目这类**有效配置变化**才会触发重载，改注释不会。
+
 
 ### 为什么需要一个外壳（boot3.js）
 
@@ -274,11 +331,38 @@ node probe/sweep-check.mjs
 自我消息过滤（含发布响应与订阅流之间的竞态）、重复消息去重、文本指令、审批按钮回执、
 提问答案映射、超时回落原生链、非目标工具放行。
 
+## 发布（维护者）
+
+```sh
+# 1) 打 tag 并推送 —— GitHub 直装靠 tag 锁定版本
+git tag v1.0.0 && git push origin main --tags
+
+# 2) 发布到 npm（本机 registry 常是镜像，登录与发布都指定官方源）
+npm login --registry https://registry.npmjs.org/
+npm publish --registry https://registry.npmjs.org/
+```
+
+发布前自查：
+
+```sh
+npm pack --dry-run    # 确认 files 列表包含 boot3.js / lib/client.js / cordis.patch.yml
+```
+
+- `package.json` 的 `private` 必须为假（本包已去掉），否则 `npm publish` 直接拒绝。
+- `publishConfig.registry` 已写死官方源；本机 `npm config` 指向 npmmirror 这类镜像时，
+  镜像**不接受发布**，必须显式指定官方源。
+- 版本号与 git tag 保持一致，`github:...#v1.0.0` 才对得上。
+- `dsh.bundle.patch` 与 `exports["./client"]` 是 DSH 发现服务端与浏览器两个半边的入口，别删。
+- 本包无构建产物，`files` 里列的就是源码本身，改动后无需任何打包步骤。
+
 ## 已验证 / 待验证
 
 已在**真机 + 真实宿主**上验证：
 
 - 热挂载、自热重载、卸载清理；配置自动迁移（单服务器 → 多服务器、散落偏好 → `defaults`）
+- **安装链路**：在临时 `DSH_HOME` 下实测 `dsh plugin --profile <p> add` 的三条路径
+  （git 规格 `git+file://…#main`，等价 `github:`、npm tarball、本地路径）都能装成，
+  且都被自动追加进 `dsh.profile.bundles`
 - 出站通知：回合结束、错误 / 中断
 - 手机在会话话题里回复即注入会话（单话题，不需要切到回复话题）；审批 / 提问按钮回执同样走它
 - **审批中转**：真实 `approval/request` 被拦截 → 推送手机 → 手机作答 → 返回 `allowed-once`，
