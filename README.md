@@ -126,6 +126,8 @@ dsh plugin --profile demo remove dsh-ntfy-remote   # 会自动从 bundles 里移
 > 本包**没有构建步骤**（纯 ESM，客户端 bundle 是手写的），所以 git 安装不会触发 pnpm 的
 > `prepare` 构建拦截，也不需要 `allowBuilds` 白名单。
 
+> GitHub 直装需要本机能访问 `github.com`。网络受限时改用下面的 npm 方式。
+
 ### 2. npm
 
 ```sh
