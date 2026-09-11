@@ -88,10 +88,34 @@
 三种方式，任选其一；装完刷新页面（客户端 bundle 会自动换 rev），然后在 DSH 输入框里
 敲 `/ntfy on`。前提：`pnpm` 在 PATH 上（`dsh plugin` 是它的转发器；缺失时会提示）。
 
+> ⚠️ **`--profile` 后面跟的是 DSH 的 *profile 名*，不是插件名。**
+> 本插件带浏览器半边（`dsh.client.platform: web`），所以要装进含 `@deepseek-ai/dsh-web-app`
+> 的 `web` profile。下面所有示例都写成 `--profile web`。
+>
+> **千万别写成 `--profile dsh-ntfy-remote`** —— 那个名字跟包名撞车，看起来很像插件身份，
+> 但它只是一个 profile 名。写错时 `dsh plugin` 不报错也不校验，而是**静默新建一个空的
+> base profile**，你的 `add` / `remove` 就全落在这个幽灵 profile 上：
+>
+> ```console
+> $ dsh plugin --profile dsh-ntfy-remote remove dsh-ntfy-remote
+> dsh: initialized profile dsh-ntfy-remote at ~/.dsh/profiles/dsh-ntfy-remote   ← 危险信号
+> Error: ERR_PNPM_CANNOT_REMOVE_MISSING_DEPS
+>   × removing a package
+>   ╰─▶ Cannot remove 'dsh-ntfy-remote': project has no dependencies of any kind
+> ```
+>
+> 看到 `dsh: initialized profile …` 就说明 profile 名打错了（正常路径下 profile 早就存在，
+> 不会打印这句）。验证插件到底有没有进加载树，用：
+>
+> ```sh
+> dsh plugin --profile web list            # 依赖视角
+> dsh --profile web --dump-config | grep ntfy   # 加载树视角
+> ```
+
 ### 1. DSH 插件：GitHub 直装（推荐）
 
 ```sh
-dsh plugin --profile dsh-ntfy-remote add github:tongwoojun/dsh-ntfy-remote
+dsh plugin --profile web add github:tongwoojun/dsh-ntfy-remote
 ```
 
 **不需要手改任何补丁文件。** `dsh plugin` 会在 profile 目录里跑 `pnpm add`，然后按
@@ -99,7 +123,7 @@ dsh plugin --profile dsh-ntfy-remote add github:tongwoojun/dsh-ntfy-remote
 （本包的 `cordis.patch.yml` 就是），它就被自动追加进层栈：
 
 ```jsonc
-// $DSH_HOME/profiles/dsh-ntfy-remote/package.json
+// $DSH_HOME/profiles/web/package.json
 {
   "dependencies": { "dsh-ntfy-remote": "github:tongwoojun/dsh-ntfy-remote" },
   "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-ntfy-remote"] } }
@@ -109,18 +133,18 @@ dsh plugin --profile dsh-ntfy-remote add github:tongwoojun/dsh-ntfy-remote
 生产环境建议**锁定 tag**，避免上游改动直接影响你：
 
 ```sh
-dsh plugin --profile dsh-ntfy-remote add github:tongwoojun/dsh-ntfy-remote#v1.0.0
+dsh plugin --profile web add github:tongwoojun/dsh-ntfy-remote#v1.0.0
 ```
 
 升级 / 卸载：
 
 ```sh
-dsh plugin --profile dsh-ntfy-remote update dsh-ntfy-remote
-dsh plugin --profile dsh-ntfy-remote remove dsh-ntfy-remote   # 会自动从 bundles 里移除
+dsh plugin --profile web update dsh-ntfy-remote
+dsh plugin --profile web remove dsh-ntfy-remote   # 会自动从 bundles 里移除
 ```
 
-> **profile 名换成你自己的**（`web`、`headless`……）。先建的 profile 用 `dsh plugin`
-> 会自动初始化一个 base-backed profile。`web` 模板是 `patchReload: live`（改配置即时生效），
+> 首次对一个**新** profile 跑 `dsh plugin` 时，它会自动初始化一个 base-backed profile
+> （并打印 `dsh: initialized profile …`）。`web` 模板是 `patchReload: live`（改配置即时生效），
 > 其它随附模板只在启动时应用补丁，需重启。
 
 > 本包**没有构建步骤**（纯 ESM，客户端 bundle 是手写的），所以 git 安装不会触发 pnpm 的
@@ -132,7 +156,7 @@ dsh plugin --profile dsh-ntfy-remote remove dsh-ntfy-remote   # 会自动从 bun
 
 ```sh
 # 直接装进 profile（同样自动加入 bundles）
-dsh plugin --profile dsh-ntfy-remote add dsh-ntfy-remote
+dsh plugin --profile web add dsh-ntfy-remote
 
 # 或作为普通依赖装进你自己的工程
 npm i dsh-ntfy-remote
@@ -141,15 +165,19 @@ npm i dsh-ntfy-remote
 ### 3. 本地路径（开发）
 
 ```sh
-dsh plugin --profile dsh-ntfy-remote add /绝对路径/dsh-ntfy-remote
+dsh plugin --profile web add /绝对路径/dsh-ntfy-remote
 ```
 
 pnpm 以 `link:` 方式链接，改完源码热重载即时生效（见下面的外壳说明）。
 
-### 手动挂载（可选）
+### 手动挂载（可选；与上面的 `dsh plugin add` 二选一）
 
 不想用 CLI 时，也可以直接往 profile 的补丁层插一条，按**包名**引用本包
 （仓库自带 `cordis.patch.yml` 就是这么写的）：
+
+> ⚠️ **这是 `dsh plugin add` 的替代方案，不要叠加。** 本包自带的 `cordis.patch.yml` 已经会插
+> 一条 `id: dsh-ntfy-remote`；包一旦装进 profile 就自动进了 `bundles`，你在这里再手写一条
+> 同 id 的条目 → **同一个 id 被 insert 两次**。要么用 CLI 装包，要么手写补丁，别两个都做。
 
 ```yaml
 # ~/.dsh/profiles/<profile>/cordis.patch.yml
