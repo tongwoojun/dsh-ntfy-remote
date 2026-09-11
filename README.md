@@ -362,24 +362,40 @@ node probe/sweep-check.mjs
 
 ## 发布（维护者）
 
+`dsh-ntfy-remote` 这个名字在 npm 上**尚未被占用**（unscoped 包，发布即 public）。
+
 ```sh
 # 1) 打 tag 并推送 —— GitHub 直装靠 tag 锁定版本
+git push origin main
 git tag v1.0.0 && git push origin main --tags
 
-# 2) 发布到 npm（本机 registry 常是镜像，登录与发布都指定官方源）
+# 2) 登录官方源（本机 npm config 常指向 npmmirror 这类镜像，镜像不接受发布）
 npm login --registry https://registry.npmjs.org/
+
+# 3) 发布
 npm publish --registry https://registry.npmjs.org/
 ```
 
-发布前自查：
+发布前自查（不联网、不发布）：
 
 ```sh
-npm pack --dry-run    # 确认 files 列表包含 boot3.js / lib/client.js / cordis.patch.yml
+npm pack --dry-run     # 确认 19 个文件里有 boot3.js / lib/client.js / cordis.patch.yml
+npm publish --dry-run  # 确认 tag=latest、access=public、没有被 private 拦下
+```
+
+发布后确认：
+
+```sh
+npm view dsh-ntfy-remote version dist.tarball
+dsh plugin --profile dsh-ntfy-remote add dsh-ntfy-remote   # 从 npm 真装一次
 ```
 
 - `package.json` 的 `private` 必须为假（本包已去掉），否则 `npm publish` 直接拒绝。
 - `publishConfig.registry` 已写死官方源；本机 `npm config` 指向 npmmirror 这类镜像时，
   镜像**不接受发布**，必须显式指定官方源。
+- 账号开了 2FA 时 `npm publish` 会要一次性验证码；非交互场景写 `npm publish --otp=123456`。
+- **再次发版必须先把 `package.json` 的 `version` 提高**（npm 不允许覆盖已发布的版本号），
+  并同步打新 tag。
 - 版本号与 git tag 保持一致，`github:...#v1.0.0` 才对得上。
 - `dsh.bundle.patch` 与 `exports["./client"]` 是 DSH 发现服务端与浏览器两个半边的入口，别删。
 - 本包无构建产物，`files` 里列的就是源码本身，改动后无需任何打包步骤。
