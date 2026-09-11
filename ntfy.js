@@ -1,0 +1,231 @@
+// ntfy 传输层：发布（一次 POST）+ 订阅（一条常驻 NDJSON 长连接）。
+//
+// 出站不需要常驻连接；入站必须常驻——这是 ntfy 的发布/订阅模型决定的，
+// 没有「拉一条就走」的等价物（?poll=1 是缓存回放，不适合实时回复）。
+//
+// 多服务器：发布与订阅都接收一个服务器描述符 `{ url, token }`。每个服务器由
+// Bridge 各建一个订阅器（见 bridge.js），因为一条连接只能连一个服务器。
+//
+// 版本透传：外壳用 ?v= 重新加载时，整张模块图都要重新求值（见 boot3.js）。
+
+const VERSION = new URL(import.meta.url).search
+const { describeError, log } = await import(`./log.js${VERSION}`)
+
+const MIN_BACKOFF_MS = 1_000
+const MAX_BACKOFF_MS = 60_000
+/** 重连补漏的时间上限：太久以前的回复没有意义，且回放会消耗服务器带宽配额。 */
+const MAX_CATCHUP_SEC = 3_600
+
+/**
+ * 归一化服务器地址（去掉尾部斜杠，否则拼出的 URL 会多一道斜杠）。
+ *
+ * @param {string} url 服务器根地址
+ * @returns {string}
+ */
+export function normalizeServer(url) {
+  return String(url ?? '').replace(/\/+$/, '')
+}
+
+/**
+ * 构造请求头；token 为空时不带 Authorization。
+ *
+ * @param {{token?: string}} server 服务器描述符
+ * @param {boolean} json 是否带 JSON Content-Type
+ * @returns {Record<string, string>}
+ */
+function headersFor(server, json) {
+  const headers = {}
+  if (json) headers['Content-Type'] = 'application/json'
+  if (typeof server?.token === 'string' && server.token !== '') {
+    headers.Authorization = `Bearer ${server.token}`
+  }
+  return headers
+}
+
+/**
+ * 发布一条消息。
+ *
+ * 返回 ntfy 分配的 message id —— 这正是「记录自己发出去的消息」的依据。注意
+ * 单靠 id 不可靠（见 bridge.js 的 MARKER_TAG 注释），所以消息里还会带固定标记。
+ *
+ * @param {{url: string, token?: string}} server 服务器描述符
+ * @param {{topic: string, message: string, title?: string, priority?: number, tags?: string[], click?: string, actions?: object[]}} payload 消息内容
+ * @returns {Promise<{ok: boolean, id?: string | null, status?: number, error?: string}>}
+ */
+export async function publish(server, payload) {
+  const url = normalizeServer(server?.url)
+  const body = { topic: payload.topic, message: payload.message }
+  if (payload.title !== undefined) body.title = payload.title
+  if (payload.priority !== undefined) body.priority = payload.priority
+  if (payload.tags !== undefined) body.tags = payload.tags
+  if (payload.click !== undefined) body.click = payload.click
+  if (payload.actions !== undefined) body.actions = payload.actions
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: headersFor(server, true),
+      body: JSON.stringify(body),
+    })
+    if (!response.ok) {
+      const text = await response.text().catch(() => '')
+      log(`ntfy: 发布失败 HTTP ${response.status} ${text.slice(0, 200)}`)
+      return { ok: false, status: response.status }
+    }
+    const data = await response.json().catch(() => null)
+    return { ok: true, id: data?.id ?? null, status: response.status }
+  } catch (error) {
+    log(`ntfy: 发布异常 ${describeError(error)}`)
+    return { ok: false, error: describeError(error) }
+  }
+}
+
+/**
+ * 可中止的 sleep；restart() 会打断等待中的退避，立即重连。
+ *
+ * @param {number} ms 毫秒
+ * @param {AbortSignal} signal 中止信号
+ * @returns {Promise<void>}
+ */
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new Error('aborted'))
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * 创建一个针对**单个服务器**的可重连、可重配话题的订阅器。
+ *
+ * @param {object} options 选项
+ * @param {() => {url: string, token?: string}} options.getServer 当前服务器描述符（每轮重读，改配置后 restart 即生效）
+ * @param {() => string[]} options.getTopics 当前要订阅的话题集合
+ * @param {() => number} options.getSince 起始补漏时间点（Unix 秒，0 表示只收实时）
+ * @param {(event: {id: string, time: number, topic: string, message: string, title?: string, tags?: string[]}) => void} options.onEvent 收到消息
+ * @param {(status: string) => void} [options.onStatus] 连接状态变化（仅用于日志）
+ * @returns {{start: () => void, stop: () => void, restart: () => void}}
+ */
+export function createSubscriber({ getServer, getTopics, getSince, onEvent, onStatus = () => {} }) {
+  let stopped = false
+  let generation = 0
+  let controller = new AbortController()
+  let attempt = 0
+  let lastStatus = null
+
+  /**
+   * 只在状态真正变化时上报，避免空闲/重连时每轮刷屏。
+   *
+   * @param {string} status 状态描述
+   */
+  const report = (status) => {
+    if (status === lastStatus) return
+    lastStatus = status
+    onStatus(status)
+  }
+
+  /** 读一条 NDJSON 流，逐行解析；连接结束或被中止时返回。 */
+  async function readStream(url, signal) {
+    const response = await fetch(url, { headers: headersFor(getServer(), false), signal })
+    if (!response.ok || response.body === null) {
+      throw new Error(`订阅失败 HTTP ${response.status}`)
+    }
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+      for (const line of lines) {
+        if (line.trim() === '') continue
+        let event
+        try {
+          event = JSON.parse(line)
+        } catch {
+          // 半行或服务端心跳的非 JSON 内容；按行缓冲会在下一轮补齐。
+          continue
+        }
+        // open / keepalive 等事件没有 message 字段，跳过。
+        if (event.event !== 'message' || typeof event.message !== 'string') continue
+        onEvent(event)
+      }
+    }
+  }
+
+  /** 主循环：连接 → 断线 → 退避 → 重连，直到 stop() 或 restart()。 */
+  async function loop(myGeneration, signal) {
+    while (!stopped && myGeneration === generation) {
+      const server = getServer()
+      const topics = getTopics()
+      if (server === null || topics.length === 0) {
+        report('idle: 没有待订阅的话题')
+        try {
+          await sleep(2_000, signal)
+        } catch {
+          return
+        }
+        continue
+      }
+
+      const since = getSince()
+      const query = since > 0 ? `?since=${since}` : ''
+      const url = `${normalizeServer(server.url)}/${topics.join(',')}/json${query}`
+      try {
+        report(`connecting: ${server.name ?? server.url} 的 ${topics.length} 个话题${query}`)
+        await readStream(url, signal)
+        report('stream ended')
+      } catch (error) {
+        if (stopped || myGeneration !== generation) return
+        report(`error: ${describeError(error)}`)
+      }
+
+      if (stopped || myGeneration !== generation) return
+      attempt += 1
+      const delay = Math.min(MAX_BACKOFF_MS, MIN_BACKOFF_MS * 2 ** Math.min(attempt, 6))
+      report(`reconnecting in ${delay}ms`)
+      try {
+        await sleep(delay, signal)
+      } catch {
+        return
+      }
+    }
+  }
+
+  return {
+    start() {
+      stopped = false
+      attempt = 0
+      controller = new AbortController()
+      const myGeneration = ++generation
+      void loop(myGeneration, controller.signal).catch((error) => {
+        log(`ntfy: 订阅循环异常退出 ${describeError(error)}`)
+      })
+    },
+    stop() {
+      stopped = true
+      generation += 1
+      controller.abort()
+    },
+    restart() {
+      generation += 1
+      controller.abort()
+      controller = new AbortController()
+      const myGeneration = generation
+      attempt = 0
+      void loop(myGeneration, controller.signal).catch((error) => {
+        log(`ntfy: 订阅循环异常退出 ${describeError(error)}`)
+      })
+    },
+  }
+}
+
+export { MAX_CATCHUP_SEC }

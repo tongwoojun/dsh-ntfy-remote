@@ -1,0 +1,12 @@
+# dsh-ntfy-remote bundle 补丁：以**包名**挂载插件本体。
+#
+# 前提：本包已装进 profile（例如 `dsh plugin --profile web add /path/to/dsh-ntfy-remote`），
+# 且 profile 的 package.json 里 `dsh.profile.bundles` 列出了 dsh-ntfy-remote。
+#
+# 只想快速试一下、不想装包的话，可以直接在补丁里写 boot3.js 的绝对路径：
+#   - insert:
+#       - id: dsh-ntfy-remote
+#         name: '/绝对路径/dsh-ntfy-remote/boot3.js'
+- insert:
+    - id: dsh-ntfy-remote
+      name: dsh-ntfy-remote
