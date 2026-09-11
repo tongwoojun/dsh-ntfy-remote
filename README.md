@@ -167,7 +167,6 @@ pnpm 以 `link:` 方式链接，改完源码热重载即时生效（见下面的
 补丁文件被 DSH 监视（profile 的 `patchReload: live`），**改动即时挂载，不需要重启
 dsh web**。注意：只有增删条目这类**有效配置变化**才会触发重载，改注释不会。
 
-
 ### 为什么需要一个外壳（boot3.js）
 
 1. **Node 会按 URL 缓存 ESM 模块**。实测：即使 `patchReload` 触发了重新挂载，`import`
