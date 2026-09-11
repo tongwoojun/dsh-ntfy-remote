@@ -401,6 +401,11 @@ dsh plugin --profile web add dsh-ntfy-remote   # 从 npm 真装一次
   2. 要在 CI / 脚本里免验证码发布，去 npmjs.com → Access Tokens → 建一个
      **Granular Access Token**：权限 Read and write、勾选 **Bypass 2FA**、有效期 ≤ 90 天，
      然后把它写进 `~/.npmrc` 的 `//registry.npmjs.org/:_authToken=…`。
+- 如果 2FA 报错消失、改成 `E403 … You may not perform that action with these credentials`，
+  那是**令牌权限**问题（说明 2FA 这一关已经过了）：Granular Token 必须是
+  **Read and write**，包范围选 **All packages** —— 新包名还没诞生，选不了
+  「Only select packages」，选了就发不出去。`npm whoami` 正常不代表有写权限。
+  改不动就退回 `npm login` + `--otp`。
 - **再次发版必须先把 `package.json` 的 `version` 提高**（npm 不允许覆盖已发布的版本号），
   并同步打新 tag。
 - 版本号与 git tag 保持一致，`github:...#v1.0.0` 才对得上。
