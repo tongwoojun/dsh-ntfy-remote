@@ -3,3 +3,8 @@ node_modules/
 *.log
 *.tmp
 .gh/
+.npm-cache/
+.pnpm-store/
+.xdg/
+.tmp-*/
+*.tgz
