@@ -393,7 +393,14 @@ dsh plugin --profile web add dsh-ntfy-remote   # 从 npm 真装一次
 - `package.json` 的 `private` 必须为假（本包已去掉），否则 `npm publish` 直接拒绝。
 - `publishConfig.registry` 已写死官方源；本机 `npm config` 指向 npmmirror 这类镜像时，
   镜像**不接受发布**，必须显式指定官方源。
-- 账号开了 2FA 时 `npm publish` 会要一次性验证码；非交互场景写 `npm publish --otp=123456`。
+- 账号开了 2FA 时，`npm publish` 会返回
+  `E403 … Two-factor authentication or granular access token with bypass 2fa enabled is required`。
+  两种解法：
+  1. 交互发布时带上当前验证码：`npm publish --registry https://registry.npmjs.org/ --otp=123456`
+     （验证码 30 秒过期，报 `EOTP` 就换一个新的重试）；
+  2. 要在 CI / 脚本里免验证码发布，去 npmjs.com → Access Tokens → 建一个
+     **Granular Access Token**：权限 Read and write、勾选 **Bypass 2FA**、有效期 ≤ 90 天，
+     然后把它写进 `~/.npmrc` 的 `//registry.npmjs.org/:_authToken=…`。
 - **再次发版必须先把 `package.json` 的 `version` 提高**（npm 不允许覆盖已发布的版本号），
   并同步打新 tag。
 - 版本号与 git tag 保持一致，`github:...#v1.0.0` 才对得上。
