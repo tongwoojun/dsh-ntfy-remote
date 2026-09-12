@@ -8,3 +8,4 @@ node_modules/
 .xdg/
 .tmp-*/
 *.tgz
+.npmrc
