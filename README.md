@@ -161,11 +161,9 @@ dsh plugin --profile web remove dsh-ntfy-remote
 
 ## 常见问题
 
-**手ntfy App哪里下**
-
+**手ntfy App哪里下？**
 iOS：[App Store](https://apps.apple.com/app/ntfy/id1625396347)
-Android：[github](https://github.com/binwiederhier/ntfy-android/releases/download/v1.25.2/ntfy-1.25.2-play-release.apk)
-
+Android：[Github](https://github.com/binwiederhier/ntfy-android/releases/download/v1.25.2/ntfy-1.25.2-play-release.apk)
 
 **手机收不到推送？**
 按顺序检查：`/ntfy status` 是否显示「桥接：已开启」→ ntfy App 里是否订阅了该话题 →
