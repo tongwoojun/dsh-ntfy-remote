@@ -1,6 +1,6 @@
 # 更新日志
 
-## 未发布（1.0.2）
+## v1.0.2
 
 **界面**：右上角 `● ntfy` 弹窗最下面（「作答超时」之下）加了 **ntfy App 下载地址**：`iOS`
 （App Store）与 `Android`（官方 GitHub Release 的 play 版 APK 直链）两个小按钮，样式与
