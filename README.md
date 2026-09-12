@@ -1,8 +1,18 @@
 # dsh-ntfy-remote
 
+[![npm version](https://img.shields.io/npm/v/dsh-ntfy-remote?label=npm)](https://www.npmjs.com/package/dsh-ntfy-remote)
+[![license](https://img.shields.io/npm/l/dsh-ntfy-remote)](./LICENSE)
+[![node](https://img.shields.io/node/v/dsh-ntfy-remote)](package.json)
+
 把**每个 DSH 会话桥接到一个 ntfy 话题**：任务完成、待审批、待提问推到手机，手机上的
 回复直接注入正在运行的会话。手机端只是一个普通的 ntfy App，不需要公网入口、不需要
 端口映射——插件主动向 ntfy 服务器建立长连接。
+
+> **已发布到 npm**：[`dsh-ntfy-remote`](https://www.npmjs.com/package/dsh-ntfy-remote)
+>
+> ```sh
+> dsh plugin --profile web add dsh-ntfy-remote
+> ```
 
 ## 话题规则
 
@@ -112,10 +122,16 @@
 > dsh --profile web --dump-config | grep ntfy   # 加载树视角
 > ```
 
-### 1. DSH 插件：GitHub 直装（推荐）
+### 1. npm（推荐）
+
+包已发布到 npm（当前 `1.0.0`），**不需要访问 GitHub**：
 
 ```sh
-dsh plugin --profile web add github:tongwoojun/dsh-ntfy-remote
+# 装进 profile（同样自动加入 bundles）
+dsh plugin --profile web add dsh-ntfy-remote
+
+# 或作为普通依赖装进你自己的工程
+npm i dsh-ntfy-remote
 ```
 
 **不需要手改任何补丁文件。** `dsh plugin` 会在 profile 目录里跑 `pnpm add`，然后按
@@ -125,15 +141,17 @@ dsh plugin --profile web add github:tongwoojun/dsh-ntfy-remote
 ```jsonc
 // $DSH_HOME/profiles/web/package.json
 {
-  "dependencies": { "dsh-ntfy-remote": "github:tongwoojun/dsh-ntfy-remote" },
+  "dependencies": { "dsh-ntfy-remote": "^1.0.0" },
   "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-ntfy-remote"] } }
 }
 ```
 
-生产环境建议**锁定 tag**，避免上游改动直接影响你：
+国内默认源（npmmirror）会自动同步；刚发版还没同步时可以显式指向官方源：
 
 ```sh
-dsh plugin --profile web add github:tongwoojun/dsh-ntfy-remote#v1.0.0
+npm view dsh-ntfy-remote version                                    # 看本机源上有没有
+dsh plugin --profile web add dsh-ntfy-remote \
+  --registry https://registry.npmjs.org/                            # 或临时指定官方源
 ```
 
 升级 / 卸载：
@@ -143,24 +161,23 @@ dsh plugin --profile web update dsh-ntfy-remote
 dsh plugin --profile web remove dsh-ntfy-remote   # 会自动从 bundles 里移除
 ```
 
-> 首次对一个**新** profile 跑 `dsh plugin` 时，它会自动初始化一个 base-backed profile
-> （并打印 `dsh: initialized profile …`）。`web` 模板是 `patchReload: live`（改配置即时生效），
-> 其它随附模板只在启动时应用补丁，需重启。
+### 2. GitHub 直装
+
+仓库公开后也可以直接从 GitHub 装。生产环境建议**锁定 tag**，避免上游改动直接影响你：
+
+```sh
+dsh plugin --profile web add github:tongwoojun/dsh-ntfy-remote
+dsh plugin --profile web add github:tongwoojun/dsh-ntfy-remote#v1.0.0
+```
+
+> GitHub 直装需要本机能访问 `github.com`；网络受限时用上面的 npm 方式。
 
 > 本包**没有构建步骤**（纯 ESM，客户端 bundle 是手写的），所以 git 安装不会触发 pnpm 的
 > `prepare` 构建拦截，也不需要 `allowBuilds` 白名单。
 
-> GitHub 直装需要本机能访问 `github.com`。网络受限时改用下面的 npm 方式。
-
-### 2. npm
-
-```sh
-# 直接装进 profile（同样自动加入 bundles）
-dsh plugin --profile web add dsh-ntfy-remote
-
-# 或作为普通依赖装进你自己的工程
-npm i dsh-ntfy-remote
-```
+> 首次对一个**新** profile 跑 `dsh plugin` 时，它会自动初始化一个 base-backed profile
+> （并打印 `dsh: initialized profile …`）。`web` 模板是 `patchReload: live`（改配置即时生效），
+> 其它随附模板只在启动时应用补丁，需重启。
 
 ### 3. 本地路径（开发）
 
@@ -362,7 +379,7 @@ node probe/sweep-check.mjs
 
 ## 发布（维护者）
 
-`dsh-ntfy-remote` 这个名字在 npm 上**尚未被占用**（unscoped 包，发布即 public）。
+`dsh-ntfy-remote` 已发布在 npm（unscoped public 包，当前 `1.0.0`）。下面是发新版本或从零重发的流程。
 
 ```sh
 # 1) 打 tag 并推送 —— GitHub 直装靠 tag 锁定版本
@@ -420,6 +437,8 @@ dsh plugin --profile web add dsh-ntfy-remote   # 从 npm 真装一次
 - **安装链路**：在临时 `DSH_HOME` 下实测 `dsh plugin --profile <p> add` 的三条路径
   （git 规格 `git+file://…#main`，等价 `github:`、npm tarball、本地路径）都能装成，
   且都被自动追加进 `dsh.profile.bundles`
+- **npm 发布链路**：`dsh-ntfy-remote@1.0.0` 已发布到官方源；分别从官方源与 npmmirror
+  各装一次都成功，并被自动追加进 `dsh.profile.bundles`
 - 出站通知：回合结束、错误 / 中断
 - 手机在会话话题里回复即注入会话（单话题，不需要切到回复话题）；审批 / 提问按钮回执同样走它
 - **审批中转**：真实 `approval/request` 被拦截 → 推送手机 → 手机作答 → 返回 `allowed-once`，
