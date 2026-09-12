@@ -161,13 +161,14 @@ dsh plugin --profile web remove dsh-ntfy-remote
 
 ## 常见问题
 
-**手ntfy App哪里下？**
+**手机的ntfy App哪里下？**
 iOS：[App Store](https://apps.apple.com/app/ntfy/id1625396347)
 Android：[Github](https://github.com/binwiederhier/ntfy-android/releases/download/v1.25.2/ntfy-1.25.2-play-release.apk)
 
 **手机收不到推送？**
 按顺序检查：`/ntfy status` 是否显示「桥接：已开启」→ ntfy App 里是否订阅了该话题 →
-App 的通知权限 → 自建服务器是否可达。公共 ntfy.sh 的免费额度会限流（HTTP 429）。
+App 的通知权限 → 自建服务器是否可达。
+注意坑：公共 ntfy.sh 的免费额度会限流（HTTP 429）。 如果有自己的服务可以自己搭建ntfy 参考: [Github](https://github.com/binwiederhier/ntfy)
 插件日志在 `$DSH_HOME/dsh-ntfy-remote/plugin.log`。
 
 **通知里多出来的 `dsh-ntfy-remote` 小字是什么？**
