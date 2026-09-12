@@ -161,6 +161,12 @@ dsh plugin --profile web remove dsh-ntfy-remote
 
 ## 常见问题
 
+**手ntfy App哪里下**
+
+iOS：[App Store](https://apps.apple.com/app/ntfy/id1625396347)
+Android：[github](https://github.com/binwiederhier/ntfy-android/releases/download/v1.25.2/ntfy-1.25.2-play-release.apk)
+
+
 **手机收不到推送？**
 按顺序检查：`/ntfy status` 是否显示「桥接：已开启」→ ntfy App 里是否订阅了该话题 →
 App 的通知权限 → 自建服务器是否可达。公共 ntfy.sh 的免费额度会限流（HTTP 429）。
@@ -176,10 +182,13 @@ App 的通知权限 → 自建服务器是否可达。公共 ntfy.sh 的免费�
 不会。手机优先接管期间网页端不显示该提问；只有等不到手机回执、超时之后才回落到网页端，
 而本地弹窗一直在等，请求不会丢。
 
+
+
 ## 开发者
 
 实现细节、架构取舍、开发 / 测试 / 发布流程、逐项验证记录见
 [`README_FOR_ME.md`](./README_FOR_ME.md)；版本变化见 [`CHANGELOG.md`](./CHANGELOG.md)。
+
 
 ## License
 
