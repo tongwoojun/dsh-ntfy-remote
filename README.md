@@ -90,13 +90,6 @@ Remote 里的绑定 / 开关 / 偏好，**不会删除 DSH 会话**（会话文�
 dsh plugin --profile web add dsh-ntfy-remote
 ```
 
-装完**刷新浏览器页面**（客户端 bundle 会自动换版本），然后在 DSH 输入框里敲 `/ntfy on`。
-
-> ⚠️ **`--profile` 后面跟的是 DSH 的 profile 名，不是插件名。** 本插件带浏览器半边
-> （`dsh.client.platform: web`），所以要装进含 `@deepseek-ai/dsh-web-app` 的 `web`
-> profile。写成 `--profile dsh-ntfy-remote` 不会报错，而是**静默新建一个空的幽灵
-> profile**，你的 `add` 就全落到那儿去了。
-
 从 GitHub 安装（可选锁定 tag，避免上游改动影响你）：
 
 ```sh
@@ -116,6 +109,8 @@ dsh plugin --profile web remove dsh-ntfy-remote
 2. 在 DSH 输入框里执行 `/ntfy on`
 3. 执行 `/ntfy test` 发一条测试通知；在手机上点开它，就落在本会话的话题里，订阅它
 4. 之后这个会话的完成、审批、提问都会推到这台手机 —— 直接在话题里回复即可作答
+
+或者进入dsh web 中进入话题在右上角找到ntfy进行点击操作
 
 ## 命令
 
