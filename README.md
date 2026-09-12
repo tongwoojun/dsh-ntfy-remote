@@ -1,275 +1,130 @@
-# dsh-ntfy-remote
+# Ntfy Remote
 
 [![npm version](https://img.shields.io/npm/v/dsh-ntfy-remote?label=npm)](https://www.npmjs.com/package/dsh-ntfy-remote)
 [![license](https://img.shields.io/npm/l/dsh-ntfy-remote)](./LICENSE)
 [![node](https://img.shields.io/node/v/dsh-ntfy-remote)](package.json)
 
-把**每个 DSH 会话桥接到一个 ntfy 话题**：任务完成、待审批、待提问推到手机，手机上的
-回复直接注入正在运行的会话。手机端只是一个普通的 ntfy App，不需要公网入口、不需要
-端口映射——插件主动向 ntfy 服务器建立长连接。
+**让 DSH 干完活叫你一声，也能在手机上直接把活答完。**
 
-> **已发布到 npm**：[`dsh-ntfy-remote`](https://www.npmjs.com/package/dsh-ntfy-remote)
->
-> ```sh
-> dsh plugin --profile web add dsh-ntfy-remote
-> ```
+DSH 跑长任务时你得守着屏幕才知道结果；模型一旦要审批、要你选方案，任务就卡在那儿等你。
+Ntfy Remote 把**每个会话桥接到一个 [ntfy](https://ntfy.sh) 话题**：任务完成、待审批、
+待提问都推到手机，你在手机上点一下按钮或打一句话，答案就直接回到正在运行的会话里。
 
-## 话题规则
+不需要公网 IP、不需要端口映射、不需要自己写机器人 —— 插件主动向 ntfy 服务器建立长连接，
+手机端就是一个普通的 ntfy App。
 
-**每个会话一个话题，出站与入站共用，直接用完整会话 id，不掺密钥**：
+## 为什么用它
 
-```
-会话 session-81c90a63-c212-4a67-a7c4-1b84c1e1bb0a
-  话题  dsh_session-81c90a63-c212-4a67-a7c4-1b84c1e1bb0a
-        出站：插件把通知 POST 到它
-        入站：插件也订阅它，手机在话题里打字即注入会话
-```
-
-长度：`dsh_`4 + 会话 id 44 = **48**，在 ntfy 的 64 上限内。
-
-> **为什么没有密钥**：44 字符的会话 id 加上 `dsh_` 前缀再加一个 16 位密钥和分隔符就是
-> **65 字符，已经超限**。所以话题名必须能从会话 id 直接推导。
-> 安全后果见下面的[安全](#安全)一节。
-
-单话题，而不是「出站话题 + `_response` 回复话题」两个：通知本身就落在会话话题里，
-**点开通知就是该话题，直接打字即可回复**，不再依赖 `ntfy://` 深链接，因此 iOS 也能用。
-代价是插件必然收到自己发出的通知，必须靠消息内容里的标记自我过滤，否则会「自己回自己」
-形成无限回环（见下）。
-
-- **出站**：一次 HTTP POST（`fetch`，不 fork curl）。
-- **入站**：每个用到的服务器一条常驻 NDJSON 长连接
-  （`GET /<话题>[,<话题>…]/json`，同一服务器上所有已开启会话的话题合并进同一条连接），
-  服务器逐行推送。
-- **自我过滤**（单话题下没有它就会无限回环）：
-  1. 主防线：每条自己发布的消息都带 `dsh-ntfy-remote` 标签，按 tag 过滤，与时间无关；
-  2. 次防线：发布响应里的 message id 记入 `ownIds`；
-  3. 兜底：正文与最近推送过的正文（每会话保留 3 条）完全一致即判为回声。
-  另外按 message id 去重（`processedIds`），避免重连补漏时重复处理同一条回复。
-- 话题规则变化时，已有绑定会在重建索引时**自动按新规则重算**，不需要重新开启
-  （旧绑定里遗留的 `responseTopic` 字段也会一并清掉）。
-
-## 多服务器与会话绑定
-
-- 服务器是**带名称的列表**（`{ id, name, url, token }`），可以加多个官方或自建实例。
-- 会话在**首次开启**时选定一个服务器，**之后不可变更**；改绑返回 `server-immutable`。
-- 唯一例外：绑定的服务器被删除后，绑定实际已失效，此时允许重新选择（界面标
-  「服务器已失效，可重选」）。
-- **删除保护**：仍有会话绑定的服务器不允许删除（返回 `server-in-use`），避免那些会话
-  永久失去推送。
-- **解绑退路**：绑定不可变是为了避免运行中改地址造成话题漂移，但服务器失联或地址填错时
-  必须有一条明确的退路——否则会死锁（改绑被拒 → 想删服务器 → 删除又因存在绑定被拒）。
-  因此**会话关闭状态下可以「解绑」**（状态页每行的「解绑」按钮，或
-  `POST /session/unbind`），解绑后该会话可重新选择服务器。
-- 每个用到的服务器各建一条订阅连接；话题集合或服务器配置变化时自动重连。
-
-## 通知偏好：全局默认 + 逐会话覆盖
-
-| 键 | 含义 |
+| 痛点 | 它怎么解决 |
 |---|---|
-| `notifyOnTurnEnd` | 回合正常结束时推送最终回复 |
-| `notifyOnPending` | 待审批 / 待提问时推送高优先级通知，并接管作答 |
-| `notifyOnError` | 回合以 error / max-tokens / blocked / interrupted 等异常结束时推送精简原因 |
-| `phonePriority` | 该会话是否由手机接管审批与提问作答 |
-| `relayTimeoutSec` | 等手机作答的秒数；超时回落 DSH 原生交互 |
+| 长任务跑完才知道结果 | 回合结束时把最终回复整段推到手机 |
+| 模型要审批 / 提问，你不在电脑前，任务干等 | 待决请求推到手机，点按钮或回一句话就作答 |
+| 自己接推送要公网入口、端口映射、HTTPS、机器人后端 | 手机端只是 ntfy App，插件主动出站长连接 |
+| 不想为通知维护一套服务 | 复用 ntfy 的发布 / 订阅，零后端代码 |
 
-`config.defaults.*` 是全局默认；`state.sessions[id].prefs.*` 只保存被单独改过的键。
-取值一律走 `Bridge.pref(sessionId, key)`：**单会话覆盖优先，否则回落全局默认**。
-`maxMessageLength` 只有全局值。用户自己在桌面点「停止」造成的取消
-（`aborted: user / parent / disposed`）一律不推送，避免自己打扰自己。
+## 功能
 
-## 界面
+### 推送到手机
 
-两处入口，内容与独立状态页一致：
+- **回合结束**：把这一轮的最终回复原文推给你（超过正文上限会截断并标注）
+- **待审批 / 待提问**：高优先级推送，审批直接带 `Approve` / `Deny` 按钮
+- **错误与中断**：模型报错、达到输出上限、被策略拦截时，推一条精简原因
+- 你自己在桌面点「停止」、以及子 agent 的回合**不会**打扰你
+- 通知就落在会话话题里：手机上点开通知即可直接回复，不依赖 `ntfy://` 深链接，**iOS 也能用**
 
-1. **会话右上角**（`conversation.session.header.utilities`）：`● ntfy` 按钮，`order: -20`，
-   排在「在本地打开」（open-in-app，`order: -10`）左边。样式复用框架的 `Button`
-   primitive（`variant: outline`、`size: sm` = 28px 高 / 14px 胶囊圆角），与同排控件一致；
-   primitives 不可用时退回自绘的同几何按钮。点开弹窗显示话题 key、链接、开关，以及
-   **本会话通知偏好**（改过的项带蓝框，可一键「跟随全局默认」）。
-2. **设置 → ntfy remote**（`settings.section`）：服务器增删改 + 会话表（话题、开关、
-   逐会话偏好、解绑）+ 全局默认偏好。
+### 在手机上作答
 
-客户端 bundle 改动后宿主会重新计算 rev 并分发新版本，**刷新页面即可**，不必重启 dsh web。
-浏览器半边由 `node probe/client-check.mjs` 做桩冒烟测试（模块体执行、
-导出、两个槽位注册、按钮排序与几何）。
+- **审批**：点 `Approve` / `Deny`
+- **提问**：选项 ≤ 3 时是按钮；超过 3 个改成编号列表，回编号即可
+- **多选提问**：回 `1,3` 一次选中多个（`,`、`、`、空格都算分隔符）
+- **自由文本**：在话题里直接打字，内容会作为你的消息注入正在运行的会话
+- **指令**：`/stop` 中止当前回合、`/status` 看状态、`/key` 看话题、`/help`
+
+### 通知偏好
+
+五项，**全局默认 + 每个会话单独覆盖**（改过的项会高亮，可一键「跟随默认」）：
+
+| 设置 | 作用 | 默认 |
+|---|---|---|
+| 回合结束推送 | 正常结束时推送最终回复 | 开 |
+| 审批 / 提问推送 | 待决时推高优先级通知并接管作答 | 开 |
+| 错误 / 中断推送 | 异常结束时推送精简原因 | 开 |
+| 手机优先接管作答 | 由手机而不是网页来答审批 / 提问 | 开 |
+| 作答超时 | 等手机作答的秒数；超时回落网页端，网页弹窗继续等，请求不会丢 | 180 秒 |
+
+另有一项全局的**正文上限**（默认 3500 字），超出会截断并标注「已截断 N 字」。
+
+会话里的「本会话通知偏好」把上面这张表直接写到了界面上：**每一项控件下面都有一行灰字说明
+它做什么**（同时也是悬停提示），不用去翻文档。
+
+### 多服务器
+
+可以配置多个带名称的 ntfy 服务器（官方 ntfy.sh 或自建，支持 access token）。会话
+**首次开启**时选定服务器，之后不可变更 —— 避免运行中改地址造成话题漂移。服务器失联或
+地址填错时留了**解绑**退路：关闭该会话的桥接后即可解绑并重选。还有会话绑着的服务器
+不允许删除，避免那些会话永久失去推送。
+
+### 三处入口
+
+1. **会话右上角 `● ntfy`**：就地开关、查看话题与链接、调整本会话通知偏好；话题名旁边是
+   两个同样式的小按钮——**网页打开**（新标签打开该话题页）和**复制**（复制话题名到剪贴板，
+   成功/失败就地回显）
+2. **设置 → Ntfy Remote**：服务器增删改、全局默认偏好、所有会话总览
+3. **状态页** `http://127.0.0.1:<端口>/dsh-ntfy-remote`：内容与设置页一致，不需要任何前端构建
+
+### 会话归档或删除后自动收起
+
+你在 DSH 里**归档**（= 从侧边栏收起）或**删除**某个会话时，插件会自动断开它的桥接，并把这行
+从「设置 → Ntfy Remote」的列表里移除 —— 不会留下一行"运行中"的幽灵记录，也不会继续订阅那个话题。
+
+列表里只列出**开过桥接的会话**（有绑定 / 开关 / 偏好），每行都有一个 **删除** 按钮：只删 Ntfy
+Remote 里的绑定 / 开关 / 偏好，**不会删除 DSH 会话**（会话文件和聊天记录都在，想再用就在那个会话里
+重新 `/ntfy on`）。与「解绑」不同，它不需要先关闭桥接，随时可用。活着但从没开过桥接的会话不会
+列在这里 —— 它们在自己的 `● ntfy` 弹窗里开启。
 
 ## 安装
 
-三种方式，任选其一；装完刷新页面（客户端 bundle 会自动换 rev），然后在 DSH 输入框里
-敲 `/ntfy on`。前提：`pnpm` 在 PATH 上（`dsh plugin` 是它的转发器；缺失时会提示）。
-
-> ⚠️ **`--profile` 后面跟的是 DSH 的 *profile 名*，不是插件名。**
-> 本插件带浏览器半边（`dsh.client.platform: web`），所以要装进含 `@deepseek-ai/dsh-web-app`
-> 的 `web` profile。下面所有示例都写成 `--profile web`。
->
-> **千万别写成 `--profile dsh-ntfy-remote`** —— 那个名字跟包名撞车，看起来很像插件身份，
-> 但它只是一个 profile 名。写错时 `dsh plugin` 不报错也不校验，而是**静默新建一个空的
-> base profile**，你的 `add` / `remove` 就全落在这个幽灵 profile 上：
->
-> ```console
-> $ dsh plugin --profile dsh-ntfy-remote remove dsh-ntfy-remote
-> dsh: initialized profile dsh-ntfy-remote at ~/.dsh/profiles/dsh-ntfy-remote   ← 危险信号
-> Error: ERR_PNPM_CANNOT_REMOVE_MISSING_DEPS
->   × removing a package
->   ╰─▶ Cannot remove 'dsh-ntfy-remote': project has no dependencies of any kind
-> ```
->
-> 看到 `dsh: initialized profile …` 就说明 profile 名打错了（正常路径下 profile 早就存在，
-> 不会打印这句）。验证插件到底有没有进加载树，用：
->
-> ```sh
-> dsh plugin --profile web list            # 依赖视角
-> dsh --profile web --dump-config | grep ntfy   # 加载树视角
-> ```
-
-### 1. npm（推荐）
-
-包已发布到 npm（当前 `1.0.0`），**不需要访问 GitHub**：
+前提：`pnpm` 在 PATH 上（`dsh plugin` 是它的转发器）。
 
 ```sh
-# 装进 profile（同样自动加入 bundles）
 dsh plugin --profile web add dsh-ntfy-remote
-
-# 或作为普通依赖装进你自己的工程
-npm i dsh-ntfy-remote
 ```
 
-**不需要手改任何补丁文件。** `dsh plugin` 会在 profile 目录里跑 `pnpm add`，然后按
-**安装后的状态**核对 `dsh.profile.bundles`：只要这个包声明了 `dsh.bundle.patch`
-（本包的 `cordis.patch.yml` 就是），它就被自动追加进层栈：
+装完**刷新浏览器页面**（客户端 bundle 会自动换版本），然后在 DSH 输入框里敲 `/ntfy on`。
 
-```jsonc
-// $DSH_HOME/profiles/web/package.json
-{
-  "dependencies": { "dsh-ntfy-remote": "^1.0.0" },
-  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "dsh-ntfy-remote"] } }
-}
-```
+> ⚠️ **`--profile` 后面跟的是 DSH 的 profile 名，不是插件名。** 本插件带浏览器半边
+> （`dsh.client.platform: web`），所以要装进含 `@deepseek-ai/dsh-web-app` 的 `web`
+> profile。写成 `--profile dsh-ntfy-remote` 不会报错，而是**静默新建一个空的幽灵
+> profile**，你的 `add` 就全落到那儿去了。
 
-国内默认源（npmmirror）会自动同步；刚发版还没同步时可以显式指向官方源：
+从 GitHub 安装（可选锁定 tag，避免上游改动影响你）：
 
 ```sh
-npm view dsh-ntfy-remote version                                    # 看本机源上有没有
-dsh plugin --profile web add dsh-ntfy-remote \
-  --registry https://registry.npmjs.org/                            # 或临时指定官方源
+dsh plugin --profile web add github:tongwoojun/dsh-ntfy-remote#v1.0.0
 ```
 
 升级 / 卸载：
 
 ```sh
 dsh plugin --profile web update dsh-ntfy-remote
-dsh plugin --profile web remove dsh-ntfy-remote   # 会自动从 bundles 里移除
+dsh plugin --profile web remove dsh-ntfy-remote
 ```
 
-### 2. GitHub 直装
+## 快速开始
 
-仓库公开后也可以直接从 GitHub 装。生产环境建议**锁定 tag**，避免上游改动直接影响你：
-
-```sh
-dsh plugin --profile web add github:tongwoojun/dsh-ntfy-remote
-dsh plugin --profile web add github:tongwoojun/dsh-ntfy-remote#v1.0.0
-```
-
-> GitHub 直装需要本机能访问 `github.com`；网络受限时用上面的 npm 方式。
-
-> 本包**没有构建步骤**（纯 ESM，客户端 bundle 是手写的），所以 git 安装不会触发 pnpm 的
-> `prepare` 构建拦截，也不需要 `allowBuilds` 白名单。
-
-> 首次对一个**新** profile 跑 `dsh plugin` 时，它会自动初始化一个 base-backed profile
-> （并打印 `dsh: initialized profile …`）。`web` 模板是 `patchReload: live`（改配置即时生效），
-> 其它随附模板只在启动时应用补丁，需重启。
-
-### 3. 本地路径（开发）
-
-```sh
-dsh plugin --profile web add /绝对路径/dsh-ntfy-remote
-```
-
-pnpm 以 `link:` 方式链接，改完源码热重载即时生效（见下面的外壳说明）。
-
-### 手动挂载（可选；与上面的 `dsh plugin add` 二选一）
-
-不想用 CLI 时，也可以直接往 profile 的补丁层插一条，按**包名**引用本包
-（仓库自带 `cordis.patch.yml` 就是这么写的）：
-
-> ⚠️ **这是 `dsh plugin add` 的替代方案，不要叠加。** 本包自带的 `cordis.patch.yml` 已经会插
-> 一条 `id: dsh-ntfy-remote`；包一旦装进 profile 就自动进了 `bundles`，你在这里再手写一条
-> 同 id 的条目 → **同一个 id 被 insert 两次**。要么用 CLI 装包，要么手写补丁，别两个都做。
-
-```yaml
-# ~/.dsh/profiles/<profile>/cordis.patch.yml
-- insert:
-    - id: dsh-ntfy-remote
-      name: dsh-ntfy-remote
-```
-
-不装包、只想快速试一下，则写 `boot3.js` 的**绝对路径**：
-
-```yaml
-- insert:
-    - id: dsh-ntfy-remote
-      name: '/绝对路径/dsh-ntfy-remote/boot3.js'
-```
-
-补丁文件被 DSH 监视（profile 的 `patchReload: live`），**改动即时挂载，不需要重启
-dsh web**。注意：只有增删条目这类**有效配置变化**才会触发重载，改注释不会。
-
-### 为什么需要一个外壳（boot3.js）
-
-1. **Node 会按 URL 缓存 ESM 模块**。实测：即使 `patchReload` 触发了重新挂载，`import`
-   命中的仍是缓存里的旧代码——**连入口文件自身也一样**。所以入口文件名一旦挂上就不再
-   改动（`boot.js` → `boot2.js` → `boot3.js` 每次都是这个原因），实现全部放在 `main.js`，
-   由外壳用 `?v=<时间戳>` 动态加载，并把版本号通过 `import.meta.url` 的查询串**透传给
-   整张模块图**。
-2. **cordis 不调用 `apply` 的返回值作为清理函数**。实测：入口从补丁里移除后，返回的
-   disposer 没有被执行，`fs.watch` 仍在后台跑。清理必须走 `ctx.effect()`。
-3. **fiber 卸载后再往同一个 ctx 注册监听会抛错**。热重载必须先用 `ctx.effect` 拿到的
-   disposer 清理旧实例。
-
-外壳还维护一个进程内**世代号**：热重载会让同一进程里先后存在多个 Bridge 实例，只有
-最新一代能订阅与推送，旧实例静默退场。
-
-### 为什么运行时零 `@deepseek-ai/*` import
-
-插件文件位于 DSH 源码仓库内，一旦 `import '@deepseek-ai/dsh-session'`，Node 会从仓库的
-`node_modules` 解析到**源码版本**，而真正在运行的是全局安装的**构建产物**。两份实例并存
-会让 branded 类型、`instanceof`、service key 出错。因此只用 `node:` 内置模块 + `ctx`
-对象，DSH 的类型只写进 JSDoc。
-
-### DSH 事件接线的两个坑
-
-1. **`approval/request` 必须用 `{ prepend: true, global: true }` 注册。**
-   `dsh-user-approval` 的分发是 `ctx.waterfall(scopeTarget(req.agent, ...), 'approval/request', ...)`，
-   带**作用域过滤**；插件自己的 ctx 不在该 agent 的作用域链里，默认**完全收不到**事件。
-   实测：会话日志里有 `approval/asked` / `approval/decided` 审计事件、网页端也答了，
-   而插件的监听一次都没被调用。`global: true` 跳过该过滤。
-   另外链上已存在 Web UI 的**终结型 answerer**（不调用 `next()`），所以还要 `prepend: true`
-   让本插件先跑，未开启桥接时再 `next()` 交回，网页端行为不变。
-2. **清理必须走 `ctx.effect()`**，见上。`ctx.on` 返回的 disposer 也要显式调用，否则热重载
-   会让同名命令重复注册而抛错。
-
-## 数据与日志
-
-全部落在 `$DSH_HOME/dsh-ntfy-remote/`（默认 `~/.dsh`，可用环境变量 `DSH_HOME` 覆盖）：
-
-| 文件 | 内容 |
-|---|---|
-| `config.json` | 服务器列表、`defaultServerId`、**全局默认偏好**（用户可改） |
-| `state.json` | 已开启的会话、服务器绑定、话题、**逐会话偏好覆盖**、去重集合 |
-| `plugin.log` | 插件日志（每行带 pid），排查挂载与推送问题的唯一可靠通道 |
-
-两个 JSON 都用「临时文件 + rename」原子写入，`dsh web` 任意时刻被 Ctrl-C 也不会留下
-半截 JSON；`state.json` 的写入合并 800ms 内的多次改动，避免每条 ntfy 消息都落盘。
+1. 手机装 **ntfy** App（iOS / Android / F-Droid 都有）
+2. 在 DSH 输入框里执行 `/ntfy on`
+3. 执行 `/ntfy test` 发一条测试通知；在手机上点开它，就落在本会话的话题里，订阅它
+4. 之后这个会话的完成、审批、提问都会推到这台手机 —— 直接在话题里回复即可作答
 
 ## 命令
 
-**DSH 输入框（`/ntfy`）**
+**DSH 输入框**
 
 | 命令 | 作用 |
 |---|---|
-| `/ntfy on` | 用默认服务器开启本会话桥接 |
-| `/ntfy on <服务器名>` | 用指定服务器开启（**仅首次有效**，之后绑定不可变） |
-| `/ntfy off` | 关闭桥接（保留服务器绑定与偏好覆盖） |
+| `/ntfy on [服务器名]` | 用默认（或指定）服务器开启本会话桥接，指定仅首次有效 |
+| `/ntfy off` | 关闭桥接（保留服务器绑定与偏好） |
 | `/ntfy key` | 只看话题 |
 | `/ntfy status` | 绑定服务器、话题、偏好及其来源 |
 | `/ntfy servers` | 列出服务器（★ 标默认） |
@@ -279,174 +134,58 @@ dsh web**。注意：只有增删条目这类**有效配置变化**才会触发�
 
 | 指令 | 作用 |
 |---|---|
-| `/stop` | 中止当前回合（`agent.cancel({kind:'user'})`） |
-| `/status` / `/key` | 桥接开关、会话是否在内存、服务器、话题与订阅地址（两者输出相同） |
+| `/stop` | 中止当前回合 |
+| `/status` / `/key` | 桥接开关、会话是否在运行、服务器、话题与订阅地址 |
 | `/help` | 帮助 |
+| 其它任何文本 | 作为你的消息注入会话；审批 / 提问待决时优先结算该请求 |
 
-其余文本一律作为用户消息注入会话。审批 / 提问待决时，自由文本会优先结算该会话**唯一**
-的待决请求；有多个待决请求时不猜，按普通消息放行。
+## ⚠️ 安全：请务必读这一段
 
-## HTTP 接口与状态页
+话题名是 `dsh_<完整会话 id>`，**可以从会话 id 直接推导出来**（44 位会话 id 再加一个密钥
+就会超过 ntfy 的 64 字话题名上限，所以话题名里没有密钥）。而会话 id 不是机密 ——
+它会出现在界面、日志、状态页和截图里。
 
-浏览器打开 `http://127.0.0.1:<port>/dsh-ntfy-remote` 即可管理，不需要任何前端构建。
-状态页里每个会话都给出**话题的 HTTP 链接**（新标签页打开 ntfy 网页版）和 `ntfy://` 手机
-跳转链接（可选快捷方式，Android 专有），并可**逐个会话**调整通知偏好（改过的键会高亮，
-可一键「跟随默认」）。同一组路由也是 Web UI 客户端（`lib/client.js`）的数据来源。
+后果是：**知道会话 id 的人就能往该话题发消息，而插件会把非自己发布的消息当作你的指令
+注入会话。** 插件只能过滤掉自己发的消息，**无法分辨其余消息是不是你本人**。
 
-| 方法 | 路径 | 作用 |
-|---|---|---|
-| GET | `/dsh-ntfy-remote` | 状态页 |
-| GET | `/dsh-ntfy-remote/status` | 状态 JSON（含生效偏好与「哪些键被覆盖」） |
-| POST | `/dsh-ntfy-remote/toggle` | `{ sessionId, enabled, serverId? }` |
-| POST | `/dsh-ntfy-remote/session/prefs` | `{ sessionId, key, value }`，`value: null` 恢复默认 |
-| POST | `/dsh-ntfy-remote/session/unbind` | `{ sessionId }`，清除服务器绑定（仅关闭状态可用） |
-| POST | `/dsh-ntfy-remote/server/add` | `{ name, url, token }` |
-| POST | `/dsh-ntfy-remote/server/update` | `{ id, name?, url?, token? }`，`token` 不传即不改 |
-| POST | `/dsh-ntfy-remote/server/delete` | `{ id }`，有绑定时 409；只剩一个服务器时也拒绝 |
-| POST | `/dsh-ntfy-remote/config` | 全局默认偏好（含 `maxMessageLength`）/ `defaultServerId` |
+所以：
 
-## 安全
+- **用公共 ntfy.sh 时**：注册账号、启用 access token，并使用保留话题前缀，让别人无法发布
+- **或者自建 ntfy**：给话题配置 ACL，只允许你的账号读写
+- 不要把会话 id 随意外传（截图、日志、分享状态页都要留意）
 
-> **话题名可以从会话 id 直接推导出来。** 以前话题里含一个随机密钥，话题名本身就是一道
-> 密码；现在没有这道密码了（44 字符的会话 id 加前缀再加密钥会超出 ntfy 的 64 字符上限）。
-> 会话 id 不是机密——它出现在界面、日志、状态页、截图里。
-
-具体风险：知道某个会话 id 的人可以往 `dsh_<会话id>` 发布消息，而插件会把非自己发布的
-消息当作**用户指令**注入会话（`agent.followup`），等同于获得操作该 agent 的入口。插件
-只能过滤「自己发的」消息（标签 + id + 正文回声），**无法分辨其余消息是不是你本人**。
-
-因此：
-
-- **必须依赖 ntfy 服务端的访问控制**：自建 ntfy 并为话题配置 ACL / 只允许你的账号读写。
-- 用公共 ntfy.sh 时，至少注册账号并使用 access token + 保留话题前缀，让陌生账号无法发布。
-- ntfy 的消息 JSON **不含发布者身份**，插件无法分辨「是不是你本人」，只能靠服务端控制。
-- 会话 id 也不要随意外传（截图、日志、分享状态页）。
-- 注入的消息仍走 DSH 的 sandbox / 权限策略，不会绕过权限；但「手机指令当用户指令」本身
-  就是权限入口。
+注入的消息仍然走 DSH 的沙箱与权限策略，不会绕过审批；但「手机指令 = 用户指令」本身
+就是权限入口。
 
 ## 已知限制
 
-- **同一 `DSH_HOME` 下不要同时跑多个 dsh 实例**：它们会读到同一份 `state.json` 并各自
-  订阅同一话题，同一条回复可能被处理两次。重启（旧进程退出、新进程接管）没有问题。
-- **不再依赖 `ntfy://` 深链接**：通知就发在会话话题里，点开即落在该话题，iOS 也能直接
-  回复。状态页与 Web UI 里仍保留 `ntfy://` 跳转链接（仅 Android 有效），只是快捷方式。
-- **插件会收到自己发出的通知**：靠 `dsh-ntfy-remote` 标签过滤；若服务端剥掉 tag，则由
-  `ownIds` 与「正文与最近推送一致」两道兜底拦截。
-- **审批 / 提问中转会接管原生交互**：`phonePriority` 为真时，开启桥接的会话在手机上等待
-  作答，DSH Web 界面不再显示该提问；超时（`relayTimeoutSec`）后回落原生链。
-- **冷会话无法注入**：会话不在内存中时（例如只存在于磁盘），插件只能提示先打开它。
-  目前不自动 `resume`，以免与 Web UI 争抢会话写所有权。
-- **会话被删除时会自动断开桥接**：不清理的话会留下订阅该话题的僵尸连接，话题列表越攒
-  越长，最终连订阅 URL 都会超长。判定删除的条件是**同时**满足「不在内存里」且「不在
-  持久化列表里」——不能拿 `session/disposed` 当删除信号，用户只是关掉会话时 agent 同样
-  会被销毁，会话本身还在磁盘上。因此：`session/disposed` 触发一次带防抖的即时核对，
-  另有 120 秒定期扫描兜底；连续 3 次核对都找不到才清理绑定；**读不到持久化列表时不动
-  任何绑定**（误删会让用户莫名其妙失去推送）。手机发来消息时若发现会话已不存在，也会
-  立刻断开并回一条说明。
-- 所有插件发出的通知都带 `dsh-ntfy-remote` 标签（自我过滤用），手机上会显示成一行小字。
-- 长文本按 `maxMessageLength` 截断，暂不支持附件发送全文。
-- 子 agent（subagent）的回合不推送，避免刷屏。
+- 同一个 `DSH_HOME` 下不要同时跑多个 `dsh` 实例：它们会订阅同一话题，同一条回复可能被处理两次
+- 会话不在内存中（冷会话）时无法注入，插件会提示你先在 DSH 里打开它
+- 长文本按正文上限截断，暂不支持发送附件
+- 子 agent（subagent）的回合不推送，避免刷屏
 
-## 开发与测试
+## 常见问题
 
-```sh
-# 纯函数自测（不联网）
-node probe/unit-check.mjs
+**手机收不到推送？**
+按顺序检查：`/ntfy status` 是否显示「桥接：已开启」→ ntfy App 里是否订阅了该话题 →
+App 的通知权限 → 自建服务器是否可达。公共 ntfy.sh 的免费额度会限流（HTTP 429）。
+插件日志在 `$DSH_HOME/dsh-ntfy-remote/plugin.log`。
 
-# ntfy 往返探针（联网，话题随机）
-node probe/ntfy-probe.mjs [server]
+**通知里多出来的 `dsh-ntfy-remote` 小字是什么？**
+插件给自己消息打的标记，用来过滤回声 —— 单话题下没有它就会「自己回自己」形成死循环。
 
-# Bridge 集成测试（真实 ntfy + 假 ctx，不碰宿主）
-DSH_HOME=$(mktemp -d) node probe/bridge-it.mjs [server]
+**我在桌面点「停止」也会推给我吗？**
+不会，用户主动取消不推送。
 
-# 客户端 bundle 冒烟（桩执行，不打开浏览器）
-node probe/client-check.mjs
+**手机上答过了，网页端还会再弹一次吗？**
+不会。手机优先接管期间网页端不显示该提问；只有等不到手机回执、超时之后才回落到网页端，
+而本地弹窗一直在等，请求不会丢。
 
-# 会话存在性核对自测（不需要网络）
-node probe/sweep-check.mjs
-```
+## 开发者
 
-> **集成测试会真的往 ntfy 发消息。** 公共 ntfy.sh 按 visitor 限流——实测短时间重复运行会
-> 返回 `HTTP 429 limit reached: too many requests`。测试识别到 429 会以**退出码 2** 报告
-> 「被限流跳过」，而不是伪装成断言失败；被限流时审批/提问用例会连带失败（通知发不出去，
-> 插件按设计回落原生链）。要反复跑请对自建 ntfy 运行，或等几分钟让配额回补。
+实现细节、架构取舍、开发 / 测试 / 发布流程、逐项验证记录见
+[`README_FOR_ME.md`](./README_FOR_ME.md)；版本变化见 [`CHANGELOG.md`](./CHANGELOG.md)。
 
-集成测试覆盖：话题规则与旧绑定自愈、多服务器订阅与路由、**绑定不可变性**、未绑定服务器
-的事件被忽略、**偏好分层**（继承 / 覆盖 / 清除 / 不串会话）、**解绑退路**、
-**会话删除后的桥接清理**（含「只是没打开」与「读列表失败」两个反向保护）、`followup` 注入与回复提取、
-自我消息过滤（含发布响应与订阅流之间的竞态）、重复消息去重、文本指令、审批按钮回执、
-提问答案映射、超时回落原生链、非目标工具放行。
+## License
 
-## 发布（维护者）
-
-`dsh-ntfy-remote` 已发布在 npm（unscoped public 包，当前 `1.0.0`）。下面是发新版本或从零重发的流程。
-
-```sh
-# 1) 打 tag 并推送 —— GitHub 直装靠 tag 锁定版本
-git push origin main
-git tag v1.0.0 && git push origin main --tags
-
-# 2) 登录官方源（本机 npm config 常指向 npmmirror 这类镜像，镜像不接受发布）
-npm login --registry https://registry.npmjs.org/
-
-# 3) 发布
-npm publish --registry https://registry.npmjs.org/
-```
-
-发布前自查（不联网、不发布）：
-
-```sh
-npm pack --dry-run     # 确认 19 个文件里有 boot3.js / lib/client.js / cordis.patch.yml
-npm publish --dry-run  # 确认 tag=latest、access=public、没有被 private 拦下
-```
-
-发布后确认：
-
-```sh
-npm view dsh-ntfy-remote version dist.tarball
-dsh plugin --profile web add dsh-ntfy-remote   # 从 npm 真装一次
-```
-
-- `package.json` 的 `private` 必须为假（本包已去掉），否则 `npm publish` 直接拒绝。
-- `publishConfig.registry` 已写死官方源；本机 `npm config` 指向 npmmirror 这类镜像时，
-  镜像**不接受发布**，必须显式指定官方源。
-- 账号开了 2FA 时，`npm publish` 会返回
-  `E403 … Two-factor authentication or granular access token with bypass 2fa enabled is required`。
-  两种解法：
-  1. 交互发布时带上当前验证码：`npm publish --registry https://registry.npmjs.org/ --otp=123456`
-     （验证码 30 秒过期，报 `EOTP` 就换一个新的重试）；
-  2. 要在 CI / 脚本里免验证码发布，去 npmjs.com → Access Tokens → 建一个
-     **Granular Access Token**：权限 Read and write、勾选 **Bypass 2FA**、有效期 ≤ 90 天，
-     然后把它写进 `~/.npmrc` 的 `//registry.npmjs.org/:_authToken=…`。
-- 如果 2FA 报错消失、改成 `E403 … You may not perform that action with these credentials`，
-  那是**令牌权限**问题（说明 2FA 这一关已经过了）：Granular Token 必须是
-  **Read and write**，包范围选 **All packages** —— 新包名还没诞生，选不了
-  「Only select packages」，选了就发不出去。`npm whoami` 正常不代表有写权限。
-  改不动就退回 `npm login` + `--otp`。
-- **再次发版必须先把 `package.json` 的 `version` 提高**（npm 不允许覆盖已发布的版本号），
-  并同步打新 tag。
-- 版本号与 git tag 保持一致，`github:...#v1.0.0` 才对得上。
-- `dsh.bundle.patch` 与 `exports["./client"]` 是 DSH 发现服务端与浏览器两个半边的入口，别删。
-- 本包无构建产物，`files` 里列的就是源码本身，改动后无需任何打包步骤。
-
-## 已验证 / 待验证
-
-已在**真机 + 真实宿主**上验证：
-
-- 热挂载、自热重载、卸载清理；配置自动迁移（单服务器 → 多服务器、散落偏好 → `defaults`）
-- **安装链路**：在临时 `DSH_HOME` 下实测 `dsh plugin --profile <p> add` 的三条路径
-  （git 规格 `git+file://…#main`，等价 `github:`、npm tarball、本地路径）都能装成，
-  且都被自动追加进 `dsh.profile.bundles`
-- **npm 发布链路**：`dsh-ntfy-remote@1.0.0` 已发布到官方源；分别从官方源与 npmmirror
-  各装一次都成功，并被自动追加进 `dsh.profile.bundles`
-- 出站通知：回合结束、错误 / 中断
-- 手机在会话话题里回复即注入会话（单话题，不需要切到回复话题）；审批 / 提问按钮回执同样走它
-- **审批中转**：真实 `approval/request` 被拦截 → 推送手机 → 手机作答 → 返回 `allowed-once`，
-  且未回落网页端
-- **提问中转**：真实 `ask_user_question` 被 `tools/execute` 拦截
-- 多服务器：新增 / 编辑 / 删除、绑定保护、改绑拒绝、**解绑退路**（开启时拒绝、关闭后可解绑、
-  解绑后可重选服务器）
-- 每会话偏好覆盖、话题 HTTP 链接
-- 超时回落原生链、自我消息过滤、重复消息去重
-
-待验证：子 agent 回合不推送（过滤条件已写在代码里，尚未在真实 subagent 回合上跑过）。
+MIT

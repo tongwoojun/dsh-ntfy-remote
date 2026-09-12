@@ -40,6 +40,15 @@ const ASSISTANT_CACHE_LIMIT = 200
 const MAX_ACTION_BUTTONS = 3
 
 /**
+ * 手机 `/stop` 之后的静默窗口：这段时间内该会话的中断推送一律压掉。
+ *
+ * 手机上取消会产生一个没有嵌套原因（`reason.reason` 缺失）的 `aborted`，
+ * `isUserInitiatedCancel()` 认不出来，不压就会推一条「回合中断：unknown」。
+ * 加时间窗是为了防止一次没等到 `turn/end` 的取消，吞掉之后真正的异常中断。
+ */
+const CANCEL_QUIET_MS = 60_000
+
+/**
  * 进程内「当前有效实例」的世代号。
  *
  * 开发期外壳会热重载，同一个进程里可能先后存在多个 Bridge 实例；旧实例的
@@ -120,6 +129,32 @@ function isUserInitiatedCancel(reason) {
 }
 
 /**
+ * 拆开一条作答文本。逗号（中英文）、顿号、分号、空白都算分隔符。
+ *
+ * @param {string} text 作答文本
+ * @returns {string[]} 片段列表
+ */
+function splitAnswerTokens(text) {
+  return String(text ?? '')
+    .split(/[,，、;；\s]+/)
+    .map((token) => token.trim())
+    .filter((token) => token !== '')
+}
+
+/**
+ * 把一个作答片段映射回选项标签：编号（1 起）与标签原文都能命中。
+ *
+ * @param {string} token 单个作答片段
+ * @param {{label: string}[]} options 选项列表
+ * @returns {string | undefined} 命中的标签
+ */
+function matchOption(token, options) {
+  const index = Number(token)
+  if (Number.isInteger(index) && index >= 1 && index <= options.length) return options[index - 1].label
+  return options.find((option) => option.label === token)?.label
+}
+
+/**
  * 生成手机 App 可点的跳转深链接。
  *
  * 注意：`ntfy://` 深链接是 Android 专有；iOS 上点通知不会切话题。
@@ -152,6 +187,8 @@ export class Bridge {
     this.pending = new Map()
     /** @type {Set<string>} 正在被手机发起的续聊驱动的会话 */
     this.inflight = new Set()
+    /** @type {Map<string, number>} sessionId → 手机最近一次 /stop 的时刻（用于压掉随之而来的中断推送） */
+    this.phoneCancels = new Map()
     /** @type {Map<string, {sessionId: string, serverId: string}>} 话题 → 归属 */
     this.topicIndex = new Map()
     /** @type {Map<string, string[]>} sessionId → 最近推送过的正文，用于回环兜底 */
@@ -208,47 +245,93 @@ export class Bridge {
   }
 
   /**
+   * 读 DSH 本体的归档集合（`workspaceRegistry.archivedSessionIds`）。
+   *
+   * 服务不在、状态未就绪、字段形状不对一律返回 null，调用方据此**不动作** ——
+   * 宁可多留一会儿绑定，也不要误删用户的推送。
+   *
+   * @returns {Set<string> | null}
+   */
+  archivedSessions() {
+    try {
+      const registry = this.ctx.get('workspaceRegistry')
+      const ids = registry?.archivedSessionIds
+      if (!Array.isArray(ids)) {
+        // 只有「取不到」时才打：将来 DSH 改了服务名或字段形状，这一行就是线索，
+        // 否则功能会静默失效（归档过的会话一直留在列表里）。
+        log(`sweep: 归档集合不可用（registry=${registry === undefined ? '取不到' : typeof registry}，ids=${typeof ids}），跳过归档核对`)
+        return null
+      }
+      return new Set(ids)
+    } catch (error) {
+      log(`sweep: 读取归档集合失败，跳过归档核对 ${describeError(error)}`)
+      return null
+    }
+  }
+
+  /**
    * 核对已开启桥接的会话是否仍然存在，把已被删除的会话的桥接主动断开。
    *
+   * 两种信号：
+   *   1. **已归档**（DSH 本体的 `archivedSessionIds`）—— 明确的用户动作、持久状态，
+   *      命中立刻清理，不等三次核对。归档不删文件，所以「不在持久化列表」那条路
+   *      永远抓不到它。
+   *   2. **已删除** —— 不在内存、也不在持久化列表。这个判定可能是瞬时的读取问题，
+   *      所以要求**连续三次**核对都这样才清理。
+   *
    * 为什么不能直接用 `session/disposed`：用户在界面里关掉会话时 agent 同样会被
-   * 拆掉并触发该事件，但会话本身还在磁盘上。所以判定删除必须**同时**满足不在
-   * 内存里、且不在持久化列表里。
+   * 拆掉并触发该事件，但会话本身还在磁盘上、也可能只是被归档。
    *
    * @returns {Promise<void>}
    */
   async sweepMissingSessions() {
     const bound = Object.keys(this.state.sessions)
     if (bound.length === 0) return
-    const persistence = this.ctx.get('sessionPersistence')
-    if (persistence === undefined || typeof persistence.list !== 'function') return
-
-    let headers
-    try {
-      headers = await persistence.list()
-    } catch (error) {
-      // 读不到列表时宁可不动：误删绑定会让用户莫名其妙地失去推送。
-      log(`sweep: 读取持久化列表失败，跳过本轮 ${describeError(error)}`)
-      return
-    }
-    const persisted = new Set(headers.map((header) => header.id))
-    const agents = this.ctx.get('agents')
 
     let changed = false
-    for (const sessionId of bound) {
-      const live = agents?.get?.(sessionId) !== undefined
-      if (live || persisted.has(sessionId)) {
-        this.missingSweeps.delete(sessionId)
-        continue
+    try {
+      const archived = this.archivedSessions()
+      if (archived !== null) {
+        for (const sessionId of bound) {
+          if (!archived.has(sessionId)) continue
+          delete this.state.sessions[sessionId]
+          this.missingSweeps.delete(sessionId)
+          changed = true
+          log(`bridge: 会话 ${sessionId} 已归档，已断开桥接并移除记录`)
+        }
       }
-      const misses = (this.missingSweeps.get(sessionId) ?? 0) + 1
-      this.missingSweeps.set(sessionId, misses)
-      if (misses < SWEEP_MISS_THRESHOLD) continue
-      delete this.state.sessions[sessionId]
-      this.missingSweeps.delete(sessionId)
-      changed = true
-      log(`bridge: 会话 ${sessionId} 已不存在（连续 ${misses} 次核对均未找到），已断开桥接并清除绑定`)
+
+      const persistence = this.ctx.get('sessionPersistence')
+      if (persistence === undefined || typeof persistence.list !== 'function') return
+
+      let headers
+      try {
+        headers = await persistence.list()
+      } catch (error) {
+        // 读不到列表时宁可不动：误删绑定会让用户莫名其妙地失去推送。
+        log(`sweep: 读取持久化列表失败，跳过本轮 ${describeError(error)}`)
+        return
+      }
+      const persisted = new Set(headers.map((header) => header.id))
+      const agents = this.ctx.get('agents')
+
+      for (const sessionId of Object.keys(this.state.sessions)) {
+        const live = agents?.get?.(sessionId) !== undefined
+        if (live || persisted.has(sessionId)) {
+          this.missingSweeps.delete(sessionId)
+          continue
+        }
+        const misses = (this.missingSweeps.get(sessionId) ?? 0) + 1
+        this.missingSweeps.set(sessionId, misses)
+        if (misses < SWEEP_MISS_THRESHOLD) continue
+        delete this.state.sessions[sessionId]
+        this.missingSweeps.delete(sessionId)
+        changed = true
+        log(`bridge: 会话 ${sessionId} 已不存在（连续 ${misses} 次核对均未找到），已断开桥接并清除绑定`)
+      }
+    } finally {
+      if (changed) this.resync()
     }
-    if (changed) this.resync()
   }
 
   /**
@@ -495,6 +578,27 @@ export class Bridge {
   }
 
   /**
+   * 忘掉一个会话：移除它在插件里的**全部记录**（服务器绑定、开关、偏好覆盖）。
+   *
+   * 与 `unbind` 的区别：`unbind` 是「换服务器」的退路，只在会话已关闭时可用；
+   * `forget` 是「这个插件不再管它了」，随时可用，**不碰 DSH 的会话本身** ——
+   * 会话文件、消息历史都在，想再用就在那个会话里重新 `/ntfy on`。
+   *
+   * @param {string} sessionId 会话 id
+   * @returns {boolean} 之前是否有记录
+   */
+  forget(sessionId) {
+    if (this.state.sessions[sessionId] === undefined) return false
+    delete this.state.sessions[sessionId]
+    this.missingSweeps.delete(sessionId)
+    this.lastAssistant.delete(sessionId)
+    this.recentOwn.delete(sessionId)
+    this.resync()
+    log(`bridge: 已移除会话 ${sessionId} 的记录`)
+    return true
+  }
+
+  /**
    * 关闭某个会话的桥接。绑定保留，重新开启时仍用同一个服务器。
    *
    * @param {string} sessionId 会话 id
@@ -510,16 +614,23 @@ export class Bridge {
   }
 
   /**
-   * 推送通知用的会话标签。
+   * 推送通知用的会话标签，也是状态页会话列表里的显示名。
+   *
+   * 形如 `DSH · <服务器名> · <会话短 id>`：中间那段优先取该会话**绑定的 ntfy 服务器名**，
+   * 这样通知标题和会话列表一眼就能看出走的是哪个服务器（同一个工作目录下的多个会话，
+   * 用目录名会完全同名，反而分不清）。没有绑定时退回工作目录名，再没有就只剩短 id。
    *
    * @param {string} sessionId 会话 id
    * @returns {string}
    */
   labelFor(sessionId) {
+    const server = this.serverFor(sessionId)
     const cwd = this.state.sessions[sessionId]?.cwd
     const dir = typeof cwd === 'string' && cwd !== '' ? cwd.split(/[\\/]/).filter(Boolean).pop() : undefined
     const short = shortSessionId(sessionId)
-    return dir === undefined ? `DSH · ${short}` : `DSH · ${dir} · ${short}`
+    const name = server === null ? undefined : server.name
+    const middle = name === undefined || name === '' ? dir : name
+    return middle === undefined ? `DSH · ${short}` : `DSH · ${middle} · ${short}`
   }
 
   /**
@@ -629,6 +740,24 @@ export class Bridge {
   }
 
   /**
+   * 消费「手机刚发起过 /stop」的标记：命中就跳过这一次中断推送。
+   *
+   * 标记用掉即删；超过 {@link CANCEL_QUIET_MS} 的陈旧标记直接丢弃，否则一次没等到
+   * `turn/end` 的取消会吞掉之后真正的异常中断。
+   *
+   * @param {string} sessionId 会话 id
+   * @returns {boolean} 是否压掉这次推送
+   */
+  consumePhoneCancel(sessionId) {
+    const at = this.phoneCancels.get(sessionId)
+    if (at === undefined) return false
+    this.phoneCancels.delete(sessionId)
+    if (Date.now() - at > CANCEL_QUIET_MS) return false
+    log(`outbound: 跳过手机 /stop 引发的中断推送 session=${sessionId}`)
+    return true
+  }
+
+  /**
    * 处理一条 DSH 会话事件。
    *
    * @param {{id: string, header?: {parentSession?: string, origin?: string, cwd?: string}}} session 会话
@@ -661,6 +790,7 @@ export class Bridge {
     }
 
     if (isUserInitiatedCancel(reason)) return
+    if (this.consumePhoneCancel(sessionId)) return
     if (this.pref(sessionId, 'notifyOnError') !== true) return
     void this.notify(sessionId, {
       title: `${this.labelFor(sessionId)} · 中断`,
@@ -741,7 +871,7 @@ export class Bridge {
    * 超时、推送失败或请求被取消都返回 null，由调用方回落 DSH 原生交互。
    *
    * @param {string} sessionId 会话 id
-   * @param {{title: string, message: string, kind: string, buttons?: {label: string, value: object}[], signal?: AbortSignal}} options 请求内容
+   * @param {{title: string, message: string, kind: string, buttons?: {label: string, value: object}[], hint?: string, signal?: AbortSignal}} options 请求内容
    * @returns {Promise<object | null>} 回执内容，或 null 表示回落
    */
   async requestDecision(sessionId, options) {
@@ -763,7 +893,7 @@ export class Bridge {
         }))
       : undefined
 
-    const hint = usable ? '\n\n点按钮，或直接在本话题回复。' : '\n\n选项较多，请回复编号，或直接在本话题回复文字。'
+    const hint = options.hint ?? (usable ? '\n\n点按钮，或直接在本话题回复。' : '\n\n选项较多，请回复编号，或直接在本话题回复文字。')
 
     const sent = await this.notify(sessionId, {
       title: options.title,
@@ -875,26 +1005,35 @@ export class Bridge {
         // 没有选项的提问无法在手机上作答（只能自由输入），交给 DSH 原生交互。
         if (options.length === 0) continue
 
-        const useButtons = options.length <= MAX_ACTION_BUTTONS
+        // 多选没法用 ntfy 动作按钮表达（按钮是无状态的单次回执，点第二个只会多出一条回执），
+        // 因此 multi_select 一律走编号 / 标签列表作答。
+        const multi = question.multi_select === true
+        const useButtons = !multi && options.length <= MAX_ACTION_BUTTONS
         const lines = [question.question ?? '提问']
         options.forEach((option, index) => lines.push(`${index + 1}. ${option.label}`))
         const decision = await this.requestDecision(agent.id, {
           title: `${this.labelFor(agent.id)} · 提问`,
           message: lines.join('\n'),
           kind: 'question',
+          hint: multi ? '\n\n多选：回复编号或标签，用逗号分隔，例如 1,3。' : undefined,
           buttons: useButtons ? options.map((option) => ({ label: option.label, value: { answer: option.label } })) : undefined,
         })
         if (decision === null) return await next()
 
-        let answer = String(decision.answer ?? '').trim()
-        if (!useButtons) {
-          const index = Number(answer)
-          if (Number.isInteger(index) && index >= 1 && index <= options.length) {
-            answer = options[index - 1].label
+        const answer = String(decision.answer ?? '').trim()
+        if (multi) {
+          const selected = []
+          for (const token of splitAnswerTokens(answer)) {
+            const label = matchOption(token, options)
+            if (label !== undefined && !selected.includes(label)) selected.push(label)
           }
+          answers.push(selected.length === 0 ? { id: question.id, selected: [], custom: answer } : { id: question.id, selected })
+          continue
         }
-        const matched = options.find((option) => option.label === answer)
-        answers.push(matched === undefined ? { id: question.id, selected: [], custom: answer } : { id: question.id, selected: [matched.label] })
+
+        // 单选：按钮回执直接就是标签；编号回复把数字映射回标签。
+        const label = useButtons ? options.find((option) => option.label === answer)?.label : matchOption(answer, options)
+        answers.push(label === undefined ? { id: question.id, selected: [], custom: answer } : { id: question.id, selected: [label] })
       }
 
       if (answers.length === 0) return await next()
@@ -974,6 +1113,8 @@ export class Bridge {
 
       if (reply !== null) {
         await this.notify(agent.id, { title: this.labelFor(agent.id), message: reply })
+      } else if (this.consumePhoneCancel(agent.id)) {
+        // 手机自己发的 /stop：这一轮不再回推一条中断通知。
       } else if (reasonKind !== null && reasonKind !== 'completed') {
         await this.notify(agent.id, {
           title: `${this.labelFor(agent.id)} · 中断`,
@@ -1035,6 +1176,8 @@ export class Bridge {
         await this.notify(sessionId, { title: this.labelFor(sessionId), message: '会话不在运行中，无需中止。' })
         return true
       }
+      // 记下这次取消是手机发起的：它产生的 aborted 没有嵌套原因，压掉那条「回合中断：unknown」。
+      this.phoneCancels.set(sessionId, Date.now())
       agent.cancel({ kind: 'user' })
       await this.notify(sessionId, { title: this.labelFor(sessionId), message: '已请求中止当前回合。' })
       return true

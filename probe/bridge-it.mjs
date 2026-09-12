@@ -212,6 +212,27 @@ check('返回提问工具的规范结果', questionResult?.isError === false && 
 check('答案映射为 selected 标签', questionResult?.value?.answers?.[0]?.selected?.[0] === '方案乙', `实际 ${JSON.stringify(questionResult?.value)}`)
 check('结果带 JSON 文本内容块', typeof questionResult?.content?.[0]?.text === 'string')
 
+console.log('\nT8b 多选提问：编号列表作答 → 多个 selected')
+seen.length = 0
+let multiFellBack = false
+const multiPromise = bridge.handleAskUserQuestion(
+  {
+    name: 'ask_user_question',
+    agent: { id: SESSION },
+    arguments: {
+      questions: [{ id: 'q3', question: '要开哪几项？', multi_select: true, options: [{ label: '甲项' }, { label: '乙项' }, { label: '丙项' }] }],
+    },
+  },
+  async () => { multiFellBack = true; return { isError: false, value: null, content: [] } },
+)
+const multiNotice = await waitFor((e) => typeof e.message === 'string' && e.message.includes('多选：回复编号'), 12_000, '多选提问通知')
+check('多选提问不下发按钮（并给出多选提示）', multiNotice !== null && (multiNotice.actions ?? []).length === 0, `actions=${JSON.stringify(multiNotice?.actions)}`)
+await publish(SERVER_A, { topic: info.topic, message: '1,3' })
+const multiResult = await multiPromise
+check('多个编号映射为多个标签', JSON.stringify(multiResult?.value?.answers?.[0]?.selected) === JSON.stringify(['甲项', '丙项']), `实际 ${JSON.stringify(multiResult?.value)}`)
+check('多选未回落原生链', multiFellBack === false)
+seen.length = 0
+
 console.log('\nT9 提问超时回落原生链')
 seen.length = 0
 bridge.config.defaults.relayTimeoutSec = 5
@@ -316,6 +337,91 @@ ctx.get = (key) => (key === 'sessionPersistence'
 for (let i = 0; i < 4; i += 1) await bridge.sweepMissingSessions()
 check('读取失败不清除绑定', state.sessions[SESSION] !== undefined)
 ctx.get = originalGet
+
+console.log('\nT19 手机 /stop：压掉随之而来的「回合中断：unknown」')
+const cancelCalls = []
+liveAgents.set(SESSION, {
+  id: SESSION,
+  session: { seq: 0, snapshotEvents: () => [] },
+  followup: () => {},
+  whenIdle: async () => {},
+  cancel: (options) => cancelCalls.push(options),
+})
+// T16/T17 重建过订阅，先等入站通道真正连通（与 T1 相同就绪探测），否则 /stop 会丢在
+// 连接建立之前，看起来像功能失败。
+let stopReady = false
+for (let attempt = 0; attempt < 6 && !stopReady; attempt += 1) {
+  await publish(SERVER_A, { topic: info.topic, message: '/status' })
+  stopReady = (await waitFor((e) => typeof e.message === 'string' && e.message.includes('桥接：'), 2500, 'T19 ready')) !== null
+  if (!stopReady) await delay(1200)
+}
+seen.length = 0
+await publish(SERVER_A, { topic: info.topic, message: '/stop' })
+const stopNotice = await waitFor((e) => typeof e.message === 'string' && e.message.includes('已请求中止当前回合'), 12_000, 'T19 /stop')
+check('收到「已请求中止当前回合。」', stopNotice !== null)
+check('调用 agent.cancel({ kind: user })', cancelCalls.length === 1 && cancelCalls[0]?.kind === 'user', JSON.stringify(cancelCalls))
+await delay(1200)
+seen.length = 0
+// 手机发起的取消产生的是「没有嵌套原因」的 aborted，isUserInitiatedCancel() 认不出来。
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/end', data: { reason: { kind: 'aborted' } } })
+await delay(1500)
+check('未推送「回合中断：unknown」', seen.length === 0, `实际 ${seen.length} 条：${seen.map((e) => e.message).join(' / ')}`)
+// 静默只吃一次：随后的真实中断必须照常推送。
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/end', data: { reason: { kind: 'max-tokens' } } })
+check('静默只吃一次，真实中断照常推送', (await waitFor((e) => typeof e.message === 'string' && e.message.includes('输出上限'), 12_000, 'T19b')) !== null)
+
+console.log('\nT20 四个开关各自单独生效（逐项隔离，不互相掩护）')
+const turnEnd = (kind) => bridge.onSessionEvent({ id: SESSION }, { type: 'turn/end', data: { reason: { kind } } })
+
+// ① notifyOnTurnEnd：关掉后回合结束不推，恢复后照推。
+bridge.lastAssistant.set(SESSION, 'T20-回合结束文本')
+bridge.setPref(SESSION, 'notifyOnTurnEnd', false)
+seen.length = 0
+turnEnd('completed')
+await delay(1500)
+check('notifyOnTurnEnd=false → 回合结束不推送', seen.length === 0, `实际 ${seen.length} 条`)
+bridge.setPref(SESSION, 'notifyOnTurnEnd', undefined)
+seen.length = 0
+turnEnd('completed')
+check('恢复默认 → 回合结束照常推送', (await waitFor((e) => typeof e.message === 'string' && e.message.includes('T20-回合结束文本'), 12_000, 'T20a')) !== null)
+
+// ② notifyOnError：只关这一项，max-tokens 的中断不该推。
+bridge.setPref(SESSION, 'notifyOnError', false)
+seen.length = 0
+turnEnd('max-tokens')
+await delay(1500)
+check('notifyOnError=false → 中断不推送', seen.length === 0, `实际 ${seen.length} 条`)
+bridge.setPref(SESSION, 'notifyOnError', undefined)
+seen.length = 0
+turnEnd('max-tokens')
+check('恢复默认 → 中断照常推送', (await waitFor((e) => typeof e.message === 'string' && e.message.includes('输出上限'), 12_000, 'T20b')) !== null)
+
+// ③ notifyOnPending=false（phonePriority 仍为真）→ 提问必须放行给原生链。
+bridge.setPref(SESSION, 'notifyOnPending', false)
+seen.length = 0
+let nextPendingOff = false
+const pendingOff = await bridge.handleAskUserQuestion(
+  { name: 'ask_user_question', agent: { id: SESSION }, arguments: { questions: [{ id: 'q20a', question: '只关待决推送', options: [{ label: '甲' }] }] } },
+  async () => { nextPendingOff = true; return { isError: false, value: { answers: [{ id: 'q20a', selected: ['甲'] }] }, content: [] } },
+)
+await delay(1000)
+check('notifyOnPending=false → 提问回落原生链', nextPendingOff === true && pendingOff?.value?.answers?.[0]?.selected?.[0] === '甲')
+check('且手机端没有推送', seen.length === 0, `实际 ${seen.length} 条`)
+bridge.setPref(SESSION, 'notifyOnPending', undefined)
+
+// ④ phonePriority=false（notifyOnPending 仍为真）→ 同样放行给原生链。
+bridge.setPref(SESSION, 'phonePriority', false)
+seen.length = 0
+let nextPhoneOff = false
+const phoneOff = await bridge.handleAskUserQuestion(
+  { name: 'ask_user_question', agent: { id: SESSION }, arguments: { questions: [{ id: 'q20b', question: '只关手机优先', options: [{ label: '乙' }] }] } },
+  async () => { nextPhoneOff = true; return { isError: false, value: { answers: [{ id: 'q20b', selected: ['乙'] }] }, content: [] } },
+)
+await delay(1000)
+check('phonePriority=false → 提问回落原生链', nextPhoneOff === true && phoneOff?.value?.answers?.[0]?.selected?.[0] === '乙')
+check('且手机端没有推送', seen.length === 0, `实际 ${seen.length} 条`)
+bridge.setPref(SESSION, 'phonePriority', undefined)
+check('四项覆盖已清回默认', Object.keys(state.sessions[SESSION].prefs ?? {}).length === 0, JSON.stringify(state.sessions[SESSION].prefs))
 
 bridge.stop()
 observer.stop()

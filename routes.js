@@ -3,7 +3,10 @@
 //   GET  /dsh-ntfy-remote                自包含状态页（无框架、无构建）
 //   GET  /dsh-ntfy-remote/status         状态 JSON
 //   POST /dsh-ntfy-remote/toggle         { sessionId, enabled, serverId? }
-//   POST /dsh-ntfy-remote/session/prefs  { sessionId, key, value }   value=null 表示恢复默认
+//   POST /dsh-ntfy-remote/session/prefs  { sessionId, key, value }   value=null 表示恢复默认；
+//                                        值按 key 校验类型/范围，与全局默认一致时等同于恢复默认
+//   POST /dsh-ntfy-remote/session/unbind { sessionId }              清除服务器绑定（仅关闭状态可用）
+//   POST /dsh-ntfy-remote/session/forget { sessionId }              删掉本插件里该会话的记录（不碰 DSH 会话）
 //   POST /dsh-ntfy-remote/server/add     { name, url, token }
 //   POST /dsh-ntfy-remote/server/update  { id, name?, url?, token? }
 //   POST /dsh-ntfy-remote/server/delete  { id }                     有绑定时拒绝
@@ -87,12 +90,17 @@ function snapshot(ctx, bridge) {
       id,
       label: bridge.labelFor(id),
       live: live.has(id),
+      // 有没有「记录」（绑定 / 开关 / 偏好）。界面只列有记录的行 —— 活着但没开过桥接的
+      // 会话列进去也没有可管的东西，反而让「删除」看起来该对每行都有。
+      recorded: info !== undefined,
       enabled: info?.enabled === true,
       serverId: info?.serverId ?? null,
       serverName: server?.name ?? null,
       serverMissing: info?.serverId !== undefined && server === null,
       topic,
       topicUrl: server === null || topic === null ? null : topicUrl(server.url, topic),
+      // 仍留在 /status JSON 里供外部脚本使用；界面上一律不显示——通知本身就落在话题里，
+      // 点开即回复，ntfy:// 深链接是多余的（见 README「不依赖 ntfy:// 深链接」）。
       deepLink: server === null || topic === null ? null : deepLink(server.url, topic),
       prefs,
       overrides: Object.keys(info?.prefs ?? {}),
@@ -174,11 +182,31 @@ export function registerRoutes(ctx, bridge) {
     const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
     const key = typeof body.key === 'string' ? body.key : ''
     if (sessionId === '' || !PREF_KEYS.includes(key)) return { ok: false, status: 400, body: { error: 'bad-session-or-key' } }
-    if (bridge.setPref(sessionId, key, body.value === null ? undefined : body.value) !== true) {
+
+    // 值校验：布尔键只收布尔，超时只收 >= 5 的有限数字。`/config`（全局默认）本来就校验，
+    // 这里不校验就会出现「界面显示 0 秒、实际按 180 秒算」这种显示与行为脱节，也会把
+    // `"abc"` / `true` 这类垃圾写进 state.json。输入框失焦即提交，所以清空数字框
+    // （浏览器提交 0）就能踩到。
+    let value
+    if (body.value === null) {
+      value = undefined
+    } else if (key === 'relayTimeoutSec') {
+      if (!Number.isFinite(body.value) || body.value < 5) return { ok: false, status: 400, body: { error: 'bad-value' } }
+      value = Math.floor(body.value)
+    } else {
+      if (typeof body.value !== 'boolean') return { ok: false, status: 400, body: { error: 'bad-value' } }
+      value = body.value
+    }
+
+    // 与全局默认一致就没什么可覆盖的：当作恢复默认。否则 `overrides` 里会堆出
+    // 一堆「值等于默认」的项，界面标蓝框却看不出差别。
+    const redundant = value !== undefined && value === bridge.config.defaults[key]
+    if (bridge.setPref(sessionId, key, redundant ? undefined : value) !== true) {
       return { ok: false, status: 404, body: { error: 'session-not-bound' } }
     }
-    log(`routes: 会话 ${sessionId} 的 ${key} → ${JSON.stringify(body.value)}`)
-    return { body: { sessionId, key, value: body.value } }
+    const stored = redundant || value === undefined ? null : value
+    log(`routes: 会话 ${sessionId} 的 ${key} → ${JSON.stringify(stored)}${redundant ? '（与默认一致，未写覆盖）' : ''}`)
+    return { body: { sessionId, key, value: stored } }
   })
 
   post('/session/unbind', async (body) => {
@@ -188,6 +216,14 @@ export function registerRoutes(ctx, bridge) {
     if (!result.ok) return { ok: false, status: 409, body: { error: result.error } }
     log(`routes: 会话 ${sessionId} 已解绑服务器`)
     return { body: { sessionId } }
+  })
+
+  post('/session/forget', async (body) => {
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+    if (sessionId === '') return { ok: false, status: 400, body: { error: 'missing-sessionId' } }
+    const removed = bridge.forget(sessionId)
+    log(`routes: 会话 ${sessionId} 的记录已删除（删除前${removed ? '有' : '无'}记录）`)
+    return { body: { sessionId, removed } }
   })
 
   post('/server/add', async (body) => {
@@ -264,7 +300,7 @@ function statusPage() {
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>dsh-ntfy-remote</title>
+<title>Ntfy Remote — dsh-ntfy-remote</title>
 <style>
  body{font:13px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;padding:24px;background:#fafafa;color:#222}
  h1{font-size:16px;margin:0 0 4px} h2{font-size:13px;margin:24px 0 8px;color:#666;font-weight:600}
@@ -282,18 +318,39 @@ function statusPage() {
  input{width:240px}
  input[type=checkbox]{width:auto;padding:0}
  .row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}
- .prefs{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px}
+ .prefs{display:flex;gap:10px 18px;align-items:flex-start;flex-wrap:wrap;font-size:12px}
+ .pref{max-width:420px}
+ .mini{display:inline-flex;align-items:center;box-sizing:border-box;padding:1px 8px;border:1px solid #ccc;border-radius:6px;background:#fff;color:inherit;font:inherit;font-size:11px;line-height:16px;cursor:pointer;text-decoration:none;white-space:nowrap}
  .prefs label{display:inline-flex;gap:4px;align-items:center;white-space:nowrap}
  .muted{color:#999} .ok{color:#2e7d32} .err{color:#b3261e}
  .tag{font-size:11px;padding:1px 6px;border-radius:99px;background:#eee;color:#666}
  .warn{background:#fff3e0;color:#b26a00}
  .ov{background:#e3f2fd;color:#1565c0}
 </style></head><body>
-<h1>dsh-ntfy-remote</h1>
+<h1>Ntfy Remote</h1>
 <div class="sub">每个 DSH 会话一个 ntfy 话题 · 手机推送与回复 · 偏好可逐会话覆盖</div>
 <div id="app">加载中…</div>
 <script>
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
+// 「作答超时」(relayTimeoutSec) 是什么：会话偏好与全局默认两处共用一句说明。
+const TIMEOUT_HINT = '作答超时：审批 / 提问推到手机后，最多等这么久你的回复；超时自动回落 DSH 原生交互，本地弹窗继续等，请求不会丢。出厂默认 180 秒。'
+// 复制话题名：优先 async clipboard（localhost / https 是安全上下文），局域网明文 http
+// 不是安全上下文，退回隐藏 textarea + execCommand。
+async function copyText(text) {
+  try {
+    if (window.navigator && window.navigator.clipboard && typeof window.navigator.clipboard.writeText === 'function') {
+      await window.navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch (e) { /* 继续走 execCommand 兜底 */ }
+  try {
+    const area = document.createElement('textarea')
+    area.value = text; area.setAttribute('readonly', '')
+    area.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0'
+    document.body.appendChild(area); area.select()
+    const ok = document.execCommand('copy'); document.body.removeChild(area); return ok
+  } catch (e) { return false }
+}
 async function api(path, body) {
   const res = await fetch('/dsh-ntfy-remote' + path, body === undefined ? {} : {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
@@ -302,7 +359,7 @@ async function api(path, body) {
   return data
 }
 function note(msg, cls) { const el = document.getElementById('note'); el.textContent = msg || ''; el.className = cls || 'muted' }
-function link(url) { return url ? '<a href="' + esc(url) + '" target="_blank" rel="noreferrer">' + esc(url) + '</a>' : '<span class="muted">—</span>' }
+function link(url) { return url ? '<a class="mini" href="' + esc(url) + '" target="_blank" rel="noreferrer" title="' + esc(url) + '">网页打开</a>' : '<span class="muted">—</span>' }
 
 async function render() {
   let s
@@ -347,52 +404,97 @@ async function render() {
   app.appendChild(servers)
 
   // ── 会话 ──
-  app.insertAdjacentHTML('beforeend', '<h2>会话（已开启 ' + s.enabledCount + ' / 共 ' + s.sessions.length + '）</h2>')
+  // 只列有记录的会话；其余活着的会话在它自己的 ● ntfy 弹窗里开启。
+  const recorded = s.sessions.filter((it) => it.recorded)
+  app.insertAdjacentHTML('beforeend', '<h2>会话记录（已开启 ' + s.enabledCount + ' / 共 ' + recorded.length + '）</h2>')
+  if (recorded.length !== s.sessions.length) {
+    app.insertAdjacentHTML('beforeend',
+      '<div class="muted" style="margin:-4px 0 8px">只列出开过桥接的会话；其它会话在它自己的 <code>● ntfy</code> 弹窗里开启。</div>')
+  }
   const table = document.createElement('table')
   table.innerHTML = '<thead><tr><th style="min-width:220px">会话</th><th>服务器</th><th style="min-width:300px">话题 / 链接</th>' +
     '<th style="min-width:260px">本会话通知偏好</th><th>开关</th></tr></thead><tbody></tbody>'
   const tbody = table.querySelector('tbody')
-  for (const it of s.sessions) {
+  for (const it of recorded) {
     const tr = document.createElement('tr')
     const serverCell = it.serverId
       ? (it.serverMissing ? '<span class="tag warn">服务器已失效，可重选</span>' : esc(it.serverName || it.serverId))
       : '<select data-role="pick"><option value="">（选择服务器）</option>' +
         s.servers.map((sv) => '<option value="' + esc(sv.id) + '">' + esc(sv.name) + '</option>').join('') + '</select>'
     const topicCell = it.topic
-      ? '<div>话题：' + link(it.topicUrl) + '</div>' +
-        (it.deepLink ? '<div class="muted">手机跳转：<a href="' + esc(it.deepLink) + '">' + esc(it.deepLink) + '</a></div>' : '')
+      ? '<div>话题：<code>' + esc(it.topic) + '</code> ' + link(it.topicUrl) + '</div>'
       : '<span class="muted">未开启</span>'
     tr.innerHTML = '<td><div>' + esc(it.label) + ' <span class="tag">' + (it.live ? '运行中' : '不在内存') + '</span>' +
       (it.overrides.length ? ' <span class="tag ov">已自定义偏好</span>' : '') + '</div>' +
       '<div class="muted"><code>' + esc(it.id) + '</code></div></td>' +
       '<td>' + serverCell + '</td><td>' + topicCell + '</td><td></td><td></td>'
 
-    // 偏好控件：勾选即写覆盖，带「跟随默认」按钮清除全部覆盖。
+    // 话题复制按钮：跟在「打开」链接后面，点了直接复制话题名。
+    if (it.topic) {
+      const copyBtn = document.createElement('button')
+      copyBtn.textContent = '复制'
+      copyBtn.title = '复制话题名（手机 ntfy App 订阅用）'
+      copyBtn.className = 'mini'
+      copyBtn.style.marginLeft = '6px'
+      copyBtn.onclick = async () => {
+        const ok = await copyText(it.topic)
+        copyBtn.textContent = ok ? '已复制' : '复制失败'
+        setTimeout(() => { copyBtn.textContent = '复制' }, 1500)
+      }
+      tr.children[2].querySelector('div').appendChild(copyBtn)
+    }
+
+    // 偏好控件：勾选即写覆盖，带「跟随默认」按钮清除全部覆盖；每项下面写清是什么。
     const prefsCell = tr.children[3]
     const box = document.createElement('div'); box.className = 'prefs'
-    const defs = { notifyOnTurnEnd: '回合', notifyOnPending: '待决', notifyOnError: '错误', phonePriority: '手机优先' }
+    const defs = {
+      notifyOnTurnEnd: { label: '回合结束推送', hint: '本回合正常跑完时，把最终回复整段推到手机。' },
+      notifyOnPending: { label: '审批 / 提问推送', hint: '需要你审批或回答时推一条高优先级通知，并等手机作答。' },
+      notifyOnError: { label: '错误 / 中断推送', hint: '模型报错、达到输出上限、被策略拦截时推精简原因；你自己在桌面点「停止」不推。' },
+      phonePriority: { label: '手机优先接管作答', hint: '待决的审批 / 提问由手机来答（网页端不再显示该弹窗）；关掉后仍会推送，但作答回到网页端。' },
+    }
     for (const key of Object.keys(defs)) {
+      const item = defs[key]
+      const block = document.createElement('div')
+      block.className = 'pref'
+      block.title = item.hint
+      if (it.overrides.includes(key)) block.style.outline = '2px solid #90caf9'
       const label = document.createElement('label')
       const cb = document.createElement('input')
       cb.type = 'checkbox'; cb.checked = it.prefs[key] === true
-      if (it.overrides.includes(key)) cb.style.outline = '2px solid #90caf9'
       cb.onchange = async () => {
         try { await api('/session/prefs', { sessionId: it.id, key, value: cb.checked }); note('已保存', 'ok'); render() }
         catch (e) { note(e.message, 'err') }
       }
-      label.append(cb, document.createTextNode(defs[key]))
-      box.appendChild(label)
+      label.append(cb, document.createTextNode(item.label))
+      const hint = document.createElement('div')
+      hint.className = 'muted'
+      hint.style.cssText = 'font-size:11px;line-height:1.5;padding-left:18px'
+      hint.textContent = item.hint
+      block.append(label, hint)
+      box.appendChild(block)
     }
+    const tBlock = document.createElement('div')
+    tBlock.className = 'pref'
+    tBlock.title = TIMEOUT_HINT
+    if (it.overrides.includes('relayTimeoutSec')) tBlock.style.outline = '2px solid #90caf9'
     const tLabel = document.createElement('label')
     const tInput = document.createElement('input')
     tInput.type = 'number'; tInput.min = '5'; tInput.value = String(it.prefs.relayTimeoutSec); tInput.style.width = '70px'; tInput.style.padding = '3px 6px'
-    if (it.overrides.includes('relayTimeoutSec')) tInput.style.outline = '2px solid #90caf9'
     tInput.onchange = async () => {
       try { await api('/session/prefs', { sessionId: it.id, key: 'relayTimeoutSec', value: Number(tInput.value) }); note('已保存', 'ok'); render() }
       catch (e) { note(e.message, 'err') }
     }
-    tLabel.append(tInput, document.createTextNode('秒'))
-    box.appendChild(tLabel)
+    tLabel.append(document.createTextNode('作答超时'), tInput, document.createTextNode('秒'))
+    tLabel.title = TIMEOUT_HINT
+    tInput.title = TIMEOUT_HINT
+    tInput.setAttribute('aria-label', '作答超时（秒）')
+    const tHint = document.createElement('div')
+    tHint.className = 'muted'
+    tHint.style.cssText = 'font-size:11px;line-height:1.5;padding-left:20px'
+    tHint.textContent = TIMEOUT_HINT
+    tBlock.append(tLabel, tHint)
+    box.appendChild(tBlock)
     prefsCell.appendChild(box)
     if (it.overrides.length) {
       const reset = document.createElement('button')
@@ -433,6 +535,19 @@ async function render() {
       }
       toggleCell.appendChild(unbind)
     }
+    // 「删除」：只删本插件里这条会话的记录（绑定 / 开关 / 偏好），不碰 DSH 会话本身。
+    if (it.serverId || it.enabled) {
+      const forget = document.createElement('button')
+      forget.textContent = '删除'
+      forget.style.marginLeft = '6px'
+      forget.title = '只删除 Ntfy Remote 里这条记录（绑定、开关、偏好），不会删除 DSH 会话'
+      forget.onclick = async () => {
+        if (!window.confirm('从 Ntfy Remote 中删除该会话的记录？不会删除 DSH 会话本身，之后可以重新开启。')) return
+        try { await api('/session/forget', { sessionId: it.id }); note('已删除', 'ok'); render() }
+        catch (e) { note(e.message, 'err') }
+      }
+      toggleCell.appendChild(forget)
+    }
     tbody.appendChild(tr)
   }
   app.appendChild(table)
@@ -444,8 +559,9 @@ async function render() {
     '<label><input type="checkbox" id="d-pending" ' + (d.notifyOnPending ? 'checked' : '') + '> 审批/提问推送</label>' +
     '<label><input type="checkbox" id="d-error" ' + (d.notifyOnError ? 'checked' : '') + '> 错误/中断推送</label>' +
     '<label><input type="checkbox" id="d-phone" ' + (d.phonePriority ? 'checked' : '') + '> 手机优先接管作答</label></div>' +
-    '<div class="row">作答超时 <input id="d-timeout" type="number" min="5" value="' + d.relayTimeoutSec + '" style="width:90px"> 秒' +
-    ' 正文上限 <input id="d-max" type="number" min="100" value="' + d.maxMessageLength + '" style="width:110px"> 字</div>' +
+    '<div class="row">作答超时 <input id="d-timeout" type="number" min="5" value="' + d.relayTimeoutSec + '" style="width:90px" title="' + esc(TIMEOUT_HINT) + '"> 秒' +
+    ' 正文上限 <input id="d-max" type="number" min="100" value="' + d.maxMessageLength + '" style="width:110px" title="推送到手机的正文最多截断到这么多字。"> 字</div>' +
+    '<div class="muted" style="font-size:11px;line-height:1.5">' + esc(TIMEOUT_HINT) + '</div>' +
     '<div class="row"><button id="d-save">保存默认</button></div>')
   document.getElementById('d-save').onclick = async () => {
     try {

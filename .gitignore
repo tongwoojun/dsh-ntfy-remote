@@ -9,3 +9,5 @@ node_modules/
 .tmp-*/
 *.tgz
 .npmrc
+README_FOR_ME.md
+TESTING.md
