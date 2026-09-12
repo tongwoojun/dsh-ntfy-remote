@@ -258,6 +258,17 @@ if (header2 !== null) {
         && openEls[0].props.target === '_blank')
     check('「网页打开」与「复制」样式一致',
       openEls.length === 1 && before !== undefined && openEls[0].props.style === before.props.style)
+
+    // 弹窗最下面的 ntfy App 下载入口：两条外链，地址必须精确。
+    const appLinks = collect(tree2, 'a').filter((n) => n.children[0] === 'iOS' || n.children[0] === 'Android')
+    check('弹窗底部有 ntfy App 下载链接（iOS + Android）', appLinks.length === 2, `实际 ${appLinks.length}`)
+    check('iOS 链接指向 App Store',
+      appLinks.find((n) => n.children[0] === 'iOS')?.props.href === 'https://apps.apple.com/app/ntfy/id1625396347',
+      JSON.stringify(appLinks.find((n) => n.children[0] === 'iOS')?.props.href))
+    check('Android 链接指向官方 APK 直链',
+      appLinks.find((n) => n.children[0] === 'Android')?.props.href
+        === 'https://github.com/binwiederhier/ntfy-android/releases/download/v1.25.2/ntfy-1.25.2-play-release.apk',
+      JSON.stringify(appLinks.find((n) => n.children[0] === 'Android')?.props.href))
     if (before !== undefined) {
       before.props.onClick()
       await tick()
@@ -292,6 +303,8 @@ if (header2 !== null) {
     check('不再渲染 ntfy:// 深链接', !allText.includes('ntfy://'))
     // 底部那段「手机 ntfy App 订阅这个话题…」长提示也已去掉。
     check('弹窗不再显示订阅 / 回复长提示', !allText.includes('点通知即落在本话题'))
+    // 取而代之的是 App 下载入口（可见标题 + 两个链接）。
+    check('弹窗底部可见「ntfy App 下载地址」', allText.includes('ntfy App 下载地址：'))
   } catch (error) {
     check('复制按钮行为验证', false, String(error && error.message ? error.message : error))
   } finally {
