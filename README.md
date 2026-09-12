@@ -189,3 +189,30 @@ App 的通知权限 → 自建服务器是否可达。公共 ntfy.sh 的免费�
 ## License
 
 MIT
+
+## web 操作参考图片
+
+dsh web中的展示
+
+**设置->ntfy remote 配置**
+
+![截图](./images/2.png)
+
+**会话中的配置1**
+
+![截图](./images/1.png)
+
+**会话中的配置2**
+![截图](./images/3.png)
+
+
+**手机订阅**
+打开 ntfy app 添加话题，话就是会话中的配置2中的：dsh_session-823eacc5-00c7-4495-898c-ebb283e43ed0
+<img src="./images/4.png" height="50%" alt="截图">
+然后点击订阅。
+
+如果需要实时通知需要在该话题下点击右上角 "..." 弹出如图
+<img src="./images/5.png" height="50%" alt="截图">
+
+然后在点击订阅设置中的即时交付
+<img src="./images/6.png" height="50%" alt="截图">
