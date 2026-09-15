@@ -36,14 +36,6 @@ export const DEFAULT_PREFS = {
   notifyOnTurnEnd: true,
   notifyOnPending: true,
   notifyOnError: true,
-  /**
-   * 单条推送正文的字节预算（**字节**，不是字符）。
-   *
-   * 超出的部分会继续分片发出去，不会被丢掉——ntfy 的 message 字段上限是
-   * 4095 字节，超了整条拒收（HTTP 500），所以这个值同时也是分片阈值。
-   * 默认 4000：留几十字节余量，分片遇到代码围栏时还要补 "```" 并重开。
-   */
-  maxMessageLength: 4000,
   relayTimeoutSec: 180,
   phonePriority: true,
 }
@@ -155,6 +147,13 @@ export function loadConfig() {
     if (source[key] !== undefined) defaults[key] = source[key]
   }
   config.defaults = defaults
+
+  // maxMessageLength 已废弃：单条正文的字节预算改成固定值（见 bridge.js 的 chunkBytes），
+  // 不再暴露给用户。清掉旧配置里的残留，免得它看起来还在生效、实际已被忽略。
+  if ('maxMessageLength' in defaults) {
+    delete defaults.maxMessageLength
+    dirty = true
+  }
 
   // 丢掉所有已被取代的旧字段，避免两套配置并存造成误解。
   for (const key of ['server', 'token', 'topicSecret', ...Object.keys(DEFAULT_PREFS)]) {

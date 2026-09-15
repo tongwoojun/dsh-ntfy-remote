@@ -61,6 +61,16 @@ const MIN_CHUNK_BYTES = 256
 const FENCE_REPAIR_BYTES = 16
 
 /**
+ * 多条消息之间的最小发送间隔（毫秒）。
+ *
+ * ntfy 的消息 `time` 只精确到**秒**，而客户端是按时间排序的。同一秒内连发多条时，
+ * 排序退化成一个不稳定的次序——真机实测三条分片在手机上显示的先后是 1、3、2，
+ * 用户看到的就是「内容全乱了」。拉开 1.1 秒保证相邻两条落在不同的秒上，顺序才稳定
+ * （间隔 ≥1s 必然跨越秒边界）。代价：一次分片推送多花几秒。
+ */
+const PUBLISH_GAP_MS = 1_100
+
+/**
  * 每个会话记住的「自己刚推出去的正文」条数，用于回声兜底。
  *
  * 必须大于一次推送的最大分片数：只记第一条的话，其余分片被服务器原样推回来时
@@ -912,16 +922,15 @@ export class Bridge {
   /**
    * 单条正文的字节预算。
    *
-   * 配置项 `maxMessageLength` 的单位是**字节**（不是字符），并且上限硬钳到
-   * ntfy 的 4095：它是「一条消息装多少」，不是「总共发多少」——超出的部分会
-   * 继续分片发出去，不会再被截断丢掉。
+   * **固定值，不再暴露给用户**：ntfy 的硬上限是 4095 字节，超出的部分会自动分片
+   * 续发、内容不丢，所以「一条装多少」没有可调价值。它只会变成一个容易填错的坑——
+   * 单位是字节而不是字，一个汉字占 3 字节，填 3500 看着像 3500 字，实际只有
+   * 1165 个汉字。留成方法只是给测试一个替换点。
    *
    * @returns {number}
    */
   chunkBytes() {
-    const raw = Number(this.config.defaults.maxMessageLength)
-    const value = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CHUNK_BYTES
-    return Math.max(MIN_CHUNK_BYTES, Math.min(value, NTFY_MESSAGE_MAX_BYTES))
+    return DEFAULT_CHUNK_BYTES
   }
 
   /**
@@ -944,10 +953,20 @@ export class Bridge {
   async sendMessages(sessionId, server, messages, base) {
     const total = messages.length
     let sent = 0
-    let firstId = null
+    let headId = null
     let error
 
-    for (let i = 0; i < total; i++) {
+    // **倒着发**。ntfy 客户端把最新的消息显示在最上面，所以按内容顺序 1、2、3 发出去，
+    // 用户在手机上从上往下读到的就是 3、2、1（真机实测确认）。倒序发送让最新的一条
+    // 正好是内容的第一条，从上往下读才是 1、2、3。
+    //   显示（最新在上）  内容 1  ← 内容 2  ← 内容 3
+    //   发送顺序          内容 3  → 内容 2  → 内容 1
+    // 响铃仍挂在**内容第一条**（最后发出）上：等所有分片都到齐了再震一下，
+    // 用户点开就能从头读到尾，而不会先看到结尾。
+    for (let k = 0; k < total; k++) {
+      const i = total - 1 - k
+      // 相邻两条之间拉开一拍：ntfy 的时间戳只到秒，同秒连发会被客户端乱序（见 PUBLISH_GAP_MS）。
+      if (k > 0) await new Promise((resolve) => setTimeout(resolve, PUBLISH_GAP_MS))
       const item = messages[i]
       let actions = item.actions
       if (Array.isArray(actions) && actions.length > MAX_ACTION_BUTTONS) {
@@ -956,10 +975,10 @@ export class Bridge {
       }
       const result = await publish(server, {
         topic: base.topic,
+        // 标题里的序号是**内容序号**（1/N 是开头那块），与发送先后无关。
         title: total > 1 && base.title !== undefined ? `${base.title} (${i + 1}/${total})` : base.title,
         message: item.message,
-        // 第一条用调用方给的优先级（可能是 undefined，即默认正常优先级），
-        // 其余一律降到 1（min，静音）。
+        // 内容第一条用调用方给的优先级（可能是 undefined，即默认正常优先级），其余静音。
         priority: i === 0 ? base.priority : 1,
         tags: base.tags,
         actions,
@@ -968,18 +987,18 @@ export class Bridge {
       })
       if (result.ok) {
         sent += 1
-        if (firstId === null) firstId = result.id ?? null
+        if (i === 0) headId = result.id ?? null
         this.rememberOwn(result.id)
         // 每一片都要记：回声兜底按正文比对，只记第一片会让其余片被当成用户输入。
         this.rememberOwnText(sessionId, item.message)
       } else {
         error = result.error ?? `HTTP ${result.status}`
-        log(`outbound: 第 ${i + 1}/${total} 条推送失败 ${error}`)
+        log(`outbound: 内容第 ${i + 1}/${total} 条推送失败 ${error}`)
       }
     }
 
     return sent > 0
-      ? { ok: true, sent, id: firstId }
+      ? { ok: true, sent, id: headId }
       : { ok: false, sent: 0, id: null, error: error ?? 'publish-failed' }
   }
 
@@ -1236,15 +1255,39 @@ export class Bridge {
     }
     if (messages.length === 0) return null
 
+    // **先挂上待决请求，再发消息。**
+    //
+    // 分片之间有 1.1 秒间隔，而按钮挂在**内容最后一块**上——倒序发送时它恰好是
+    // 最先送达的那一条。用户完全可能在剩余分片还在路上时就点了按钮。如果像以前
+    // 那样等 sendMessages 全部发完才登记，这条回执会被 settlePending 漏掉、当成
+    // 普通消息注入会话，而请求继续空等到超时再回落原生（集成测试稳定复现：
+    // 只收到 1 条分片、答案是 null）。
+    const decision = this.waitForDecision(requestId, sessionId, options.kind, options.signal)
+
     const sent = await this.sendMessages(sessionId, server, messages, {
       topic: binding.topic,
       title: options.title,
       priority: 4,
       tags: [MARKER_TAG],
     })
-    if (!sent.ok) return null
+    if (!sent.ok) {
+      // 一条都没发出去：撤掉等待，免得白挂一个到超时的请求。
+      this.cancelDecision(requestId)
+      return null
+    }
 
-    return await this.waitForDecision(requestId, sessionId, options.kind, options.signal)
+    return await decision
+  }
+
+  /**
+   * 撤销一个尚未结算的待决请求（等同超时）。
+   *
+   * @param {string} requestId 请求 id
+   */
+  cancelDecision(requestId) {
+    const pending = this.pending.get(requestId)
+    if (pending === undefined) return
+    pending.finish(null)
   }
 
   /**

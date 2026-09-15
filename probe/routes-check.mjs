@@ -8,7 +8,6 @@
 
 import { Readable } from 'node:stream'
 import { Bridge, deepLink } from '../bridge.js'
-import { NTFY_MESSAGE_MAX_BYTES } from '../ntfy.js'
 import { topicFor } from '../topics.js'
 import { qrSvg } from '../qr.js'
 import { PREFIX, registerRoutes } from '../routes.js'
@@ -52,7 +51,6 @@ const config = {
     notifyOnTurnEnd: true,
     notifyOnPending: true,
     notifyOnError: true,
-    maxMessageLength: 4000,
     relayTimeoutSec: 180,
     phonePriority: true,
   },
@@ -148,10 +146,9 @@ const page = await call('', undefined, 'GET')
 check('状态页返回 HTML 骨架', page.raw.includes('<script>') && page.raw.includes('id="app"'))
 const leaked = page.raw.match(/NTFY_[A-Z_]+/g) ?? []
 check('没有把宿主常量泄漏进浏览器脚本', leaked.length === 0, `命中：${leaked.join(', ')}`)
-check('浏览器脚本自带单条上限常量', page.raw.includes('const MAX_MESSAGE_BYTES = 4095'))
-check('单条上限输入框引用的是浏览器侧常量',
-  page.raw.includes('max="\' + MAX_MESSAGE_BYTES + \'"'),
-  '输入框没有引用 MAX_MESSAGE_BYTES')
+check('单条上限已从状态页移除（不再暴露给用户）',
+  !page.raw.includes('单条上限') && !page.raw.includes('d-max'),
+  '状态页仍残留单条上限控件')
 
 console.log('参数校验（都应被拒绝，且不落盘）')
 const rejections = [
@@ -201,16 +198,14 @@ res = await call('/server/delete', { id: tempId })
 check('删除未绑定的服务器 → 200', res.status === 200, JSON.stringify(res.json))
 res = await call('/server/delete', { id: 'srv_a' })
 check('只剩一个服务器 → 409 last-server', res.status === 409 && res.json.error === 'last-server', JSON.stringify(res.json))
-await call('/config', { relayTimeoutSec: 3, maxMessageLength: 50 })
+await call('/config', { relayTimeoutSec: 3 })
 check('全局超时 <5 被忽略', config.defaults.relayTimeoutSec === 180, String(config.defaults.relayTimeoutSec))
-check('全局正文上限 <100 被忽略', config.defaults.maxMessageLength === 4000, String(config.defaults.maxMessageLength))
-await call('/config', { relayTimeoutSec: 45, maxMessageLength: 500 })
-check('全局超时 45 / 正文上限 500 生效', config.defaults.relayTimeoutSec === 45 && config.defaults.maxMessageLength === 500)
-// 超过 ntfy 硬上限必须被钳住：否则分片预算贴着 4096，服务端会整条拒收（HTTP 500）。
-await call('/config', { maxMessageLength: 999999 })
-check('正文上限超过 ntfy 硬上限被钳住',
-  config.defaults.maxMessageLength === NTFY_MESSAGE_MAX_BYTES,
-  String(config.defaults.maxMessageLength))
+await call('/config', { relayTimeoutSec: 45 })
+check('全局超时 45 生效', config.defaults.relayTimeoutSec === 45, String(config.defaults.relayTimeoutSec))
+// maxMessageLength 已废弃：单条正文预算改成固定值，界面与接口都不再接受它。
+await call('/config', { maxMessageLength: 500 })
+check('废弃的 maxMessageLength 不再落进配置',
+  config.defaults.maxMessageLength === undefined, String(config.defaults.maxMessageLength))
 
 console.log('「删除记录」（forget）：只删插件里的记录，不动 DSH 会话')
 res = await call('/session/forget', {})

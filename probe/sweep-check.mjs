@@ -48,7 +48,7 @@ const config = {
   defaultServerId: 'srv_x',
   defaults: {
     notifyOnTurnEnd: true, notifyOnPending: true, notifyOnError: true,
-    maxMessageLength: 3500, relayTimeoutSec: 180, phonePriority: true,
+    relayTimeoutSec: 180, phonePriority: true,
   },
 }
 const state = { sessions: {}, lastSeenTs: 0, processedIds: [], ownIds: [] }

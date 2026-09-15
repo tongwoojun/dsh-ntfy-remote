@@ -74,7 +74,6 @@ const config = {
     notifyOnTurnEnd: true,
     notifyOnPending: true,
     notifyOnError: true,
-    maxMessageLength: 4000,
     relayTimeoutSec: 30,
     phonePriority: true,
   },
@@ -118,6 +117,18 @@ async function waitFor(predicate, timeoutMs, label) {
 function requestIdOf(event) {
   const body = event?.actions?.[0]?.body
   return typeof body === 'string' ? JSON.parse(body).requestId : undefined
+}
+
+/**
+ * 从标题末尾的 (k/n) 里取出**内容序号**。
+ *
+ * 分片是**倒序发送**的（见 bridge.js 的 sendMessages：ntfy 把最新的显示在最上面，
+ * 倒着发才能让用户从上往下读到 1、2、3），所以订阅流的到达顺序与内容顺序相反，
+ * 断言前必须按这个序号还原，不能假设 seen 的先后。
+ */
+function contentIndexOf(event) {
+  const m = /\((\d+)\/(\d+)\)\s*$/.exec(String(event?.title ?? ''))
+  return m === null ? 0 : Number(m[1])
 }
 
 await delay(2500)
@@ -265,10 +276,17 @@ const richPromise = bridge.handleAskUserQuestion(
   },
   async () => ({ isError: false, value: null, content: [] }),
 )
-await waitFor((e) => typeof e.message === 'string' && e.message.includes('方案丁'), 12_000, 'T8c 第二组选项')
+// 倒序发送：**头块最后发出、最后到达**，等到它就说明全批都到齐了。
+// （以前等最后一块，现在那块最先到，只能等到 1 条。）
+await waitFor((e) => typeof e.message === 'string' && e.message.includes('要执行哪个方案？'), 15_000, 'T8c 头块')
 await delay(800)
-const batch = seen.filter((e) => Array.isArray(e.tags) && e.tags.includes('dsh-ntfy-remote'))
+const arrival = seen.filter((e) => Array.isArray(e.tags) && e.tags.includes('dsh-ntfy-remote'))
+// 倒序发送 → 订阅流的到达顺序是反的，按 (k/n) 还原成内容顺序再断言。
+const batch = [...arrival].sort((a, b) => contentIndexOf(a) - contentIndexOf(b))
 const batchText = batch.map((e) => e.message).join('\n')
+check('分片按倒序发送（最新在上，用户从上往下读到 1、2、3）',
+  arrival.length > 1 && contentIndexOf(arrival[arrival.length - 1]) === 1,
+  `到达顺序的内容序号：${JSON.stringify(arrival.map(contentIndexOf))}`)
 
 check('4 个选项拆成了多条', batch.length >= 3, `实际 ${batch.length} 条`)
 check('每个选项的 description 都发出去了',
@@ -288,6 +306,11 @@ check('后续条一律静音（priority 1）', batch.slice(1).every((e) => e.pri
 check('多条时标题带 (k/n)',
   batch.length > 1 && batch.every((e, i) => typeof e.title === 'string' && e.title.includes(`(${i + 1}/${batch.length})`)),
   `实际 ${JSON.stringify(batch.map((e) => e.title))}`)
+// ntfy 的 time 只到秒，且客户端按时间排序：同一秒内连发的多条会被手机重排
+// （真机实测三条显示成 1、3、2）。这里钉住「相邻分片必须落在不同的秒上」。
+check('分片之间落在不同的秒上（否则手机端会乱序）',
+  new Set(batch.map((e) => e.time)).size === batch.length,
+  `实际时间戳 ${JSON.stringify(batch.map((e) => e.time))}`)
 
 // 单选即使带按钮，直接回编号也必须还原成标签（旧实现此处会落成 custom）。
 await publish(SERVER_A, { topic: info.topic, message: '4' })
@@ -319,10 +342,12 @@ const multiRichPromise = bridge.handleAskUserQuestion(
   },
   async () => { multiRichFellBack = true; return { isError: false, value: null, content: [] } },
 )
-await waitFor((e) => typeof e.message === 'string' && e.message.includes('T8D-丁项'), 12_000, 'T8d 第二组选项')
+await waitFor((e) => typeof e.message === 'string' && e.message.includes('要开哪几项？T8D'), 15_000, 'T8d 头块')
 await delay(800)
-const multiBatch = seen.filter((e) => Array.isArray(e.tags) && e.tags.includes('dsh-ntfy-remote')
+const multiArrival = seen.filter((e) => Array.isArray(e.tags) && e.tags.includes('dsh-ntfy-remote')
   && typeof e.message === 'string' && e.message.includes('T8D'))
+// 同上：倒序发送，按 (k/n) 还原内容顺序。
+const multiBatch = [...multiArrival].sort((a, b) => contentIndexOf(a) - contentIndexOf(b))
 const multiBatchText = multiBatch.map((e) => e.message).join('\n')
 check('多选 4 个选项拆成了多条', multiBatch.length >= 3, `实际 ${multiBatch.length} 条`)
 check('多选时不带按钮', multiBatch.every((e) => (e.actions ?? []).length === 0))
@@ -339,6 +364,32 @@ check('多选编号跨组映射为两个标签',
   JSON.stringify(multiRichResult?.value?.answers?.[0]?.selected) === JSON.stringify(['T8D-甲项', 'T8D-丁项']),
   `实际 ${JSON.stringify(multiRichResult?.value)}`)
 check('多选未回落原生链', multiRichFellBack === false)
+seen.length = 0
+
+console.log('\nT8e 手快竞态：分片还没发完就点按钮，回执不能丢')
+// 分片之间有 1.1 秒间隔，而按钮挂在**内容最后一块**上——倒序发送时它最先到达。
+// 用户完全可能在剩余分片还在路上时就点按钮。这条用例模拟「立刻点击」：
+// 只要 requestDecision 是等 sendMessages 发完才登记待决请求，回执就会被漏掉、
+// 当成普通消息注入，而请求继续空等到超时（真机与集成测试都复现过）。
+seen.length = 0
+bridge.chunkBytes = () => 160                          // 逼出多条分片（预算已固定，测试里覆写）
+const raceLong = '这是一段很长的说明文字，用来把正文撑过单条上限从而拆成两条分片。'.repeat(3)
+const racePromise = bridge.requestDecision(SESSION, {
+  title: '竞态',
+  kind: 'question',
+  parts: [{ message: raceLong, buttons: [{ label: '立刻点我', value: { answer: '立刻点我' } }] }],
+})
+const raceHit = await waitFor(
+  (e) => (e.actions ?? []).some((a) => typeof a.body === 'string' && a.body.includes('立刻点我')),
+  12_000, 'T8e 按钮分片',
+)
+check('收到了带按钮的分片', raceHit !== null)
+const raceRequestId = JSON.parse(raceHit.actions[0].body).requestId
+// 不等其余分片，立刻作答。
+await publish(SERVER_A, { topic: info.topic, message: JSON.stringify({ requestId: raceRequestId, answer: '立刻点我' }) })
+const raceResult = await racePromise
+check('分片未发完就作答，回执仍被正确结算',
+  raceResult !== null && raceResult.answer === '立刻点我', `实际 ${JSON.stringify(raceResult)}`)
 seen.length = 0
 
 console.log('\nT9 提问超时回落原生链')

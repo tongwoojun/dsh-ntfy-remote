@@ -19,7 +19,6 @@ const VERSION = new URL(import.meta.url).search
 const { describeError, log } = await import(`./log.js${VERSION}`)
 const { PREF_KEYS, newServerId, normalizeServer, saveConfig } = await import(`./config.js${VERSION}`)
 const { deepLink } = await import(`./bridge.js${VERSION}`)
-const { NTFY_MESSAGE_MAX_BYTES } = await import(`./ntfy.js${VERSION}`)
 const { topicUrl } = await import(`./topics.js${VERSION}`)
 const { qrSvg } = await import(`./qr.js${VERSION}`)
 
@@ -307,10 +306,6 @@ export function registerRoutes(ctx, bridge) {
       if (typeof body[key] === 'boolean') config.defaults[key] = body[key]
     }
     if (Number.isFinite(body.relayTimeoutSec) && body.relayTimeoutSec >= 5) config.defaults.relayTimeoutSec = Math.floor(body.relayTimeoutSec)
-    // 单条正文的字节预算：下限 100（再小就切得太碎），上限钳到 ntfy 的硬上限。
-    if (Number.isFinite(body.maxMessageLength) && body.maxMessageLength >= 100) {
-      config.defaults.maxMessageLength = Math.min(Math.floor(body.maxMessageLength), NTFY_MESSAGE_MAX_BYTES)
-    }
     if (typeof body.defaultServerId === 'string' && config.servers.some((s) => s.id === body.defaultServerId)) {
       config.defaultServerId = body.defaultServerId
     }
@@ -373,12 +368,6 @@ function statusPage() {
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
 // 「作答超时」(relayTimeoutSec) 是什么：会话偏好与全局默认两处共用一句说明。
 const TIMEOUT_HINT = '作答超时：审批 / 提问推到手机后，最多等这么久你的回复；超时自动回落 DSH 原生交互，本地弹窗继续等，请求不会丢。出厂默认 180 秒。'
-// ntfy 单条 message 的字节硬上限。宿主侧 ntfy.js 导出的同名常量才是权威值，但这段脚本
-// 跑在**浏览器**里，看不到 Node 模块作用域的标识符——直接引用宿主常量会抛 ReferenceError，
-// 让整段「全局默认」渲染不出来。所以这里必须自带一份字面量。
-const MAX_MESSAGE_BYTES = 4095
-// 「单条上限」说明：单位是字节不是字，且超限是拆条而不是截断。
-const MAX_MESSAGE_HINT = '单条推送正文的字节上限（一个汉字约 3 字节）。超出会拆成多条继续发，内容不会丢；ntfy 硬上限 4095 字节，出厂默认 4000。'
 // 复制话题名：优先 async clipboard（localhost / https 是安全上下文），局域网明文 http
 // 不是安全上下文，退回隐藏 textarea + execCommand。
 async function copyText(text) {
@@ -604,8 +593,7 @@ async function render() {
     '<label><input type="checkbox" id="d-pending" ' + (d.notifyOnPending ? 'checked' : '') + '> 审批/提问推送</label>' +
     '<label><input type="checkbox" id="d-error" ' + (d.notifyOnError ? 'checked' : '') + '> 错误/中断推送</label>' +
     '<label><input type="checkbox" id="d-phone" ' + (d.phonePriority ? 'checked' : '') + '> 手机优先接管作答</label></div>' +
-    '<div class="row">作答超时 <input id="d-timeout" type="number" min="5" value="' + d.relayTimeoutSec + '" style="width:90px" title="' + esc(TIMEOUT_HINT) + '"> 秒' +
-    ' 单条上限 <input id="d-max" type="number" min="100" max="' + MAX_MESSAGE_BYTES + '" value="' + d.maxMessageLength + '" style="width:110px" title="' + MAX_MESSAGE_HINT + '"> 字节</div>' +
+    '<div class="row">作答超时 <input id="d-timeout" type="number" min="5" value="' + d.relayTimeoutSec + '" style="width:90px" title="' + esc(TIMEOUT_HINT) + '"> 秒</div>' +
     '<div class="muted" style="font-size:11px;line-height:1.5">' + esc(TIMEOUT_HINT) + '</div>' +
     '<div class="row"><button id="d-save">保存默认</button></div>')
   document.getElementById('d-save').onclick = async () => {
@@ -616,7 +604,6 @@ async function render() {
         notifyOnError: document.getElementById('d-error').checked,
         phonePriority: document.getElementById('d-phone').checked,
         relayTimeoutSec: Number(document.getElementById('d-timeout').value),
-        maxMessageLength: Number(document.getElementById('d-max').value),
       })
       note('默认已保存', 'ok'); render()
     } catch (e) { note(e.message, 'err') }
