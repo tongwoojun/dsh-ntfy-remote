@@ -29,7 +29,7 @@ const ID_MEMORY_LIMIT = 500
 const FIRST_SERVER = { name: '官方 ntfy.sh', url: 'https://ntfy.sh', token: '' }
 
 /** 可被单会话覆盖的偏好键。 */
-export const PREF_KEYS = ['notifyOnTurnEnd', 'notifyOnPending', 'notifyOnError', 'phonePriority', 'relayTimeoutSec']
+export const PREF_KEYS = ['notifyOnTurnEnd', 'notifyOnPending', 'notifyOnError', 'phonePriority', 'relayTimeoutSec', 'notifyOnWebTurn']
 
 /** 全局默认偏好。 */
 export const DEFAULT_PREFS = {
@@ -38,6 +38,23 @@ export const DEFAULT_PREFS = {
   notifyOnError: true,
   relayTimeoutSec: 180,
   phonePriority: true,
+  /**
+   * 回合心跳间隔（秒）——**唯一暴露给用户的时间配置**。
+   *
+   * 其余两个时间都由它推导，避免出现互相矛盾的手填值（见 bridge.js）：
+   *   死信超时 = 3 × 心跳间隔   （多久没续期就报警）
+   *   卡住阈值 = 9 × 心跳间隔   （多久没进展算疑似卡住）
+   * 所以默认 20 秒 ⇒ 死信 60 秒、卡住 180 秒。
+   */
+  heartbeatSec: 20,
+  /**
+   * 网页 / 桌面发起的回合，要不要也推送到手机（**逐会话可覆盖**）。
+   *
+   * 默认 true = 保持原有行为：不论这一轮从哪发起，回复与心跳都推到手机。
+   * 关掉后只有**手机发起**的回合会通知手机——适合"人就在电脑前，别再来打扰我"的会话；
+   * 代价是放弃「在电脑上发起长任务、走开后手机收结果」这个场景，所以做成开关而不是改默认。
+   */
+  notifyOnWebTurn: true,
 }
 
 /** 配置默认值；用户不写 config.json 也能直接跑。 */

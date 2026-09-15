@@ -1,6 +1,6 @@
 {
   "name": "dsh-ntfy-remote",
-  "version": "1.0.6",
+  "version": "1.1.0",
   "description": "把每个 DSH 会话桥接到一个 ntfy 话题：手机推送、手机回复、审批与提问中转。",
   "license": "MIT",
   "author": "tongwoojun",

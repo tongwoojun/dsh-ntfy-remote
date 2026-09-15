@@ -8,7 +8,7 @@
 //   DSH_HOME 指向临时目录，避免污染真实的状态与配置。
 
 import { Bridge } from '../bridge.js'
-import { createSubscriber, publish as rawPublish } from '../ntfy.js'
+import { createSubscriber, publish as rawPublish, removeMessage } from '../ntfy.js'
 
 /**
  * 发布包装：命中 ntfy.sh 免费版的发布速率限制（HTTP 429）时立刻中止并明确报告为
@@ -37,7 +37,16 @@ const url = (process.argv[2] ?? 'https://ntfy.sh').replace(/\/+$/, '')
  * 反复跑不会被卡住。
  */
 const token = process.argv[3] ?? ''
-const SESSION = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+/**
+ * 每次运行用**不同**的会话 id，从而得到不同的 ntfy 话题。
+ *
+ * 原来写死成 session-aaaa…，话题固定不变，结果服务器上同一条话题攒了三百多条历史
+ * 消息：任何残留或外部误发的消息都会被订阅流收进来，把某个待决请求按文本结算掉，
+ * 造成一串看似无关的失败（实测被一条外部发的 `triggered` 打中过）。
+ * 会话 id 的形态保持 `session-<uuid>`，T13 断言的话题规则仍然成立。
+ */
+const RUN_TAG = Date.now().toString(16).padStart(12, '0').slice(-12)
+const SESSION = `session-aaaaaaaa-1111-2222-3333-${RUN_TAG}`
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 let failed = 0
@@ -74,6 +83,7 @@ const config = {
     notifyOnTurnEnd: true,
     notifyOnPending: true,
     notifyOnError: true,
+    notifyOnWebTurn: true,
     relayTimeoutSec: 30,
     phonePriority: true,
   },
@@ -229,7 +239,7 @@ check('返回提问工具的规范结果', questionResult?.isError === false && 
 check('答案映射为 selected 标签', questionResult?.value?.answers?.[0]?.selected?.[0] === '方案乙', `实际 ${JSON.stringify(questionResult?.value)}`)
 check('结果带 JSON 文本内容块', typeof questionResult?.content?.[0]?.text === 'string')
 
-console.log('\nT8b 多选提问：编号列表作答 → 多个 selected')
+console.log('\nT8b 多选提问：文本编号作答仍然可用（与按钮并存）')
 seen.length = 0
 let multiFellBack = false
 const multiPromise = bridge.handleAskUserQuestion(
@@ -242,23 +252,89 @@ const multiPromise = bridge.handleAskUserQuestion(
   },
   async () => { multiFellBack = true; return { isError: false, value: null, content: [] } },
 )
-const multiNotice = await waitFor((e) => typeof e.message === 'string' && e.message.includes('多选：回复编号'), 12_000, '多选提问通知')
-check('多选提问不下发按钮（并给出多选提示）', multiNotice !== null && (multiNotice.actions ?? []).length === 0, `actions=${JSON.stringify(multiNotice?.actions)}`)
+const multiNotice = await waitFor((e) => typeof e.message === 'string' && e.message.includes('点「提交」'), 15_000, '多选提问通知')
+const multiActionBodies = (multiNotice?.actions ?? []).map((a) => { try { return JSON.parse(a.body) } catch { return {} } })
+check('多选下发切换按钮', multiActionBodies.some((b) => typeof b.toggle === 'string'), `actions=${JSON.stringify(multiNotice?.actions)}`)
+check('多选下发提交按钮', multiActionBodies.some((b) => b.submit === true))
+check('两个按钮共用同一个 requestId',
+  new Set(multiActionBodies.map((b) => b.requestId)).size === 1)
+// 文本作答这条路必须保留：想手打的人不该被按钮挡住。
 await publish(SERVER_A, { topic: info.topic, message: '1,3' })
 const multiResult = await multiPromise
 check('多个编号映射为多个标签', JSON.stringify(multiResult?.value?.answers?.[0]?.selected) === JSON.stringify(['甲项', '丙项']), `实际 ${JSON.stringify(multiResult?.value)}`)
 check('多选未回落原生链', multiFellBack === false)
 seen.length = 0
 
+console.log('\nT8b2 多选提问：点按钮切换选中 → 点提交结算')
+seen.length = 0
+let toggleFellBack = false
+const togglePromise = bridge.handleAskUserQuestion(
+  {
+    name: 'ask_user_question',
+    agent: { id: SESSION },
+    arguments: {
+      questions: [{ id: 'q3b', header: '多选按钮', question: '要开哪几项？T8B2', multi_select: true, options: [{ label: 'T8B2-甲' }, { label: 'T8B2-乙' }, { label: 'T8B2-丙' }] }],
+    },
+  },
+  async () => { toggleFellBack = true; return { isError: false, value: null, content: [] } },
+)
+const toggleNotice = await waitFor(
+  (e) => (e.actions ?? []).some((a) => typeof a.body === 'string' && a.body.includes('T8B2-甲')),
+  15_000, 'T8B2 切换按钮',
+)
+check('收到切换按钮', toggleNotice !== null)
+// 等整批到齐：切换按钮和「提交」按钮**不在同一条消息上**（多选最后一组要腾一个
+// 按钮位给提交，3 个选项会被切成 [甲,乙] 和 [丙,提交] 两条）。所以按钮要从整批里找。
+await delay(1500)
+const toggleBatch = seen.filter((e) => Array.isArray(e.tags) && e.tags.includes('dsh-ntfy-remote')
+  && typeof e.message === 'string' && e.message.includes('T8B2'))
+const toggleBodies = toggleBatch.flatMap((e) => e.actions ?? [])
+  .map((a) => { try { return JSON.parse(a.body) } catch { return {} } })
+const bodyFor = (predicate) => {
+  const hit = toggleBodies.find(predicate)
+  return hit === undefined ? null : JSON.stringify(hit)
+}
+const toggleBody = bodyFor((b) => b.toggle === 'T8B2-甲')
+const thirdBody = bodyFor((b) => b.toggle === 'T8B2-丙')
+const submitBody = bodyFor((b) => b.submit === true)
+check('整批里能取到切换按钮与提交按钮', toggleBody !== null && thirdBody !== null && submitBody !== null,
+  `实际 ${JSON.stringify(toggleBodies.map((b) => b.toggle ?? 'submit'))}`)
+// 点「甲」→ 再点一次「甲」取消 → 再点「甲」「丙」→ 提交
+await publish(SERVER_A, { topic: info.topic, message: toggleBody })
+await delay(500)
+await publish(SERVER_A, { topic: info.topic, message: toggleBody })
+await delay(500)
+await publish(SERVER_A, { topic: info.topic, message: toggleBody })
+await delay(500)
+await publish(SERVER_A, { topic: info.topic, message: thirdBody })
+await delay(500)
+check('切换过程中请求仍待决（没有被提前结算）', toggleFellBack === false)
+await publish(SERVER_A, { topic: info.topic, message: submitBody })
+const toggleResult = await togglePromise
+check('提交后返回累积的选中集合',
+  JSON.stringify(toggleResult?.value?.answers?.[0]?.selected) === JSON.stringify(['T8B2-甲', 'T8B2-丙']),
+  `实际 ${JSON.stringify(toggleResult?.value)}`)
+check('多选按钮路径未回落原生链', toggleFellBack === false)
+// 过期回执：请求已结算，用户又点了旧通知上残留的按钮。必须丢弃——把原始 JSON
+// 当成用户消息注入会话的话，模型会收到一段乱码（真机实测踩到）。
+const beforeStale = followupCalls.length
+await publish(SERVER_A, { topic: info.topic, message: toggleBody })
+await delay(1500)
+check('过期回执被丢弃，不会注入会话',
+  followupCalls.length === beforeStale, `followup ${beforeStale} → ${followupCalls.length}`)
+seen.length = 0
+
 console.log('\nT8c 提问内容完整性：描述 / header / 计划正文都要真发出去')
 // 旧的实现只发 question + label，option.description、header、detail 全丢，而且
 // 超过 3 个选项就退化成「回复编号」。这里逐项钉住「桌面端看得到的，手机上也看得到」。
 seen.length = 0
+// 内容里带 T8C 标记：服务器上同话题的历史/外部消息不能混进批次，
+// 否则会捡到别的用例的正文（实测捡到过 T4 的「这是模型的回复」）。
 const richOptions = [
-  { label: '方案甲', description: '会删除数据，不可恢复。' },
-  { label: '方案乙', description: '只做备份，不动原数据。' },
-  { label: '方案丙', description: '什么都不做。' },
-  { label: '方案丁', description: '第四个选项，用来验证跨组编号。' },
+  { label: 'T8C-方案甲', description: '会删除数据，不可恢复。' },
+  { label: 'T8C-方案乙', description: '只做备份，不动原数据。' },
+  { label: 'T8C-方案丙', description: '什么都不做。' },
+  { label: 'T8C-方案丁', description: '第四个选项，用来验证跨组编号。' },
 ]
 const richPromise = bridge.handleAskUserQuestion(
   {
@@ -268,7 +344,7 @@ const richPromise = bridge.handleAskUserQuestion(
       questions: [{
         id: 'q4',
         header: '选择模式',
-        question: '要执行哪个方案？',
+        question: '要执行哪个方案？T8C',
         detail: '## 计划\n\n1. 备份\n2. 执行',
         options: richOptions,
       }],
@@ -278,9 +354,10 @@ const richPromise = bridge.handleAskUserQuestion(
 )
 // 倒序发送：**头块最后发出、最后到达**，等到它就说明全批都到齐了。
 // （以前等最后一块，现在那块最先到，只能等到 1 条。）
-await waitFor((e) => typeof e.message === 'string' && e.message.includes('要执行哪个方案？'), 15_000, 'T8c 头块')
+await waitFor((e) => typeof e.message === 'string' && e.message.includes('要执行哪个方案？T8C'), 15_000, 'T8c 头块')
 await delay(800)
-const arrival = seen.filter((e) => Array.isArray(e.tags) && e.tags.includes('dsh-ntfy-remote'))
+const arrival = seen.filter((e) => Array.isArray(e.tags) && e.tags.includes('dsh-ntfy-remote')
+  && typeof e.message === 'string' && e.message.includes('T8C'))
 // 倒序发送 → 订阅流的到达顺序是反的，按 (k/n) 还原成内容顺序再断言。
 const batch = [...arrival].sort((a, b) => contentIndexOf(a) - contentIndexOf(b))
 const batchText = batch.map((e) => e.message).join('\n')
@@ -316,7 +393,7 @@ check('分片之间落在不同的秒上（否则手机端会乱序）',
 await publish(SERVER_A, { topic: info.topic, message: '4' })
 const richResult = await richPromise
 check('回编号也能命中跨组选项',
-  richResult?.value?.answers?.[0]?.selected?.[0] === '方案丁',
+  richResult?.value?.answers?.[0]?.selected?.[0] === 'T8C-方案丁',
   `实际 ${JSON.stringify(richResult?.value)}`)
 seen.length = 0
 
@@ -350,7 +427,12 @@ const multiArrival = seen.filter((e) => Array.isArray(e.tags) && e.tags.includes
 const multiBatch = [...multiArrival].sort((a, b) => contentIndexOf(a) - contentIndexOf(b))
 const multiBatchText = multiBatch.map((e) => e.message).join('\n')
 check('多选 4 个选项拆成了多条', multiBatch.length >= 3, `实际 ${multiBatch.length} 条`)
-check('多选时不带按钮', multiBatch.every((e) => (e.actions ?? []).length === 0))
+const multiAllActions = multiBatch.flatMap((e) => e.actions ?? []).map((a) => { try { return JSON.parse(a.body) } catch { return {} } })
+check('多选每个选项都带切换按钮',
+  multiRichOptions.every((o) => multiAllActions.some((b) => b.toggle === o.label)),
+  `实际 ${JSON.stringify(multiAllActions.map((b) => b.toggle ?? 'submit'))}`)
+check('多选恰好一个提交按钮', multiAllActions.filter((b) => b.submit === true).length === 1,
+  `实际 ${multiAllActions.filter((b) => b.submit === true).length} 个`)
 check('多选每个选项的 label 都发出去了',
   multiRichOptions.every((o) => multiBatchText.includes(o.label)))
 check('多选每条 description 都发出去了（这就是报的 bug）',
@@ -582,7 +664,219 @@ check('且手机端没有推送', seen.length === 0, `实际 ${seen.length} 条`
 bridge.setPref(SESSION, 'phonePriority', undefined)
 check('四项覆盖已清回默认', Object.keys(state.sessions[SESSION].prefs ?? {}).length === 0, JSON.stringify(state.sessions[SESSION].prefs))
 
-bridge.stop()
+console.log('\nT21 回合心跳：状态通知原地更新 → 收尾变 ✅')
+// 用最短的心跳间隔（5s）让测试跑得动；派生时间随之变成 死信 15s / 卡住 45s。
+bridge.config.defaults.heartbeatSec = 5
+bridge.enable(SESSION)
+seen.length = 0
+
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/start', data: { turn: 1 } })
+const ack = await waitFor((e) => typeof e.title === 'string' && e.title.includes('思考中'), 10_000, 'T21 ACK')
+check('回合开始立刻发状态通知（ACK）', ack !== null)
+check('ACK 响铃（priority 3）', ack?.priority === 3, `实际 ${ack?.priority}`)
+check('带 sequence_id（原地更新用）',
+  typeof ack?.sequence_id === 'string' && ack.sequence_id.startsWith('dsh-turn-'), `实际 ${ack?.sequence_id}`)
+const stopAction = (ack?.actions ?? []).find((a) => a.body === '/stop')
+check('挂中止按钮，点击发回 /stop', stopAction !== undefined, JSON.stringify(ack?.actions))
+check('按钮显示中文「停止」（中文只进 JSON body，不受非 ASCII 头限制）',
+  stopAction?.label === '停止', JSON.stringify(stopAction?.label))
+check('按钮 URL 指向本会话话题',
+  typeof stopAction?.url === 'string' && stopAction.url.endsWith('/' + info.topic), JSON.stringify(stopAction?.url))
+check('带展示标签「dsh状态通知」', (ack?.tags ?? []).includes('dsh状态通知'), JSON.stringify(ack?.tags))
+check('仍然保留回声过滤用的标记 tag', (ack?.tags ?? []).includes('dsh-ntfy-remote'), JSON.stringify(ack?.tags))
+check('正文是 markdown', ack?.content_type === 'text/markdown')
+check('标题是「思考中」', ack?.title.includes('🟢 DSH 思考中'))
+
+// 有进展的事件应刷新「最近输出」，不改变状态。
+bridge.onSessionEvent({ id: SESSION }, { type: 'tool/call', data: { name: 'bash' } })
+await delay(6500)
+const ticks = seen.filter((e) => typeof e.title === 'string' && e.title.includes('思考中'))
+check('到点原地更新第二拍', ticks.length >= 2, `实际 ${ticks.length} 拍`)
+check('两拍共用同一个 sequence_id（客户端才会替换而不是新增）',
+  new Set(ticks.map((e) => e.sequence_id)).size === 1, JSON.stringify(ticks.map((e) => e.sequence_id)))
+check('后续拍静音（priority 1）',
+  ticks.slice(1).every((e) => e.priority === 1), JSON.stringify(ticks.map((e) => e.priority)))
+
+seen.length = 0
+await bridge.finishHeartbeat(SESSION)
+const done = await waitFor((e) => typeof e.title === 'string' && e.title.includes('已完成'), 10_000, 'T21 收尾')
+check('收尾原地更新成 ✅', done !== null)
+check('✅ 与心跳共用同一个 sequence_id',
+  done?.sequence_id === ack?.sequence_id, `${done?.sequence_id} vs ${ack?.sequence_id}`)
+check('✅ 不再挂 /stop 按钮', (done?.actions ?? []).length === 0, JSON.stringify(done?.actions))
+check('✅ 也带「dsh状态通知」标签', (done?.tags ?? []).includes('dsh状态通知'), JSON.stringify(done?.tags))
+
+console.log('\nT22 死信开关：进程"卡死"后由 ntfy 服务器自行投递告警')
+seen.length = 0
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/start', data: { turn: 2 } })
+check('已起搏（死信开关随之挂上）',
+  (await waitFor((e) => typeof e.title === 'string' && e.title.includes('思考中'), 10_000, 'T22 起搏')) !== null)
+// 模拟「进程卡死」：停掉定时器但**不走收尾**——于是没人再续期死信开关。
+bridge.stopHeartbeatTimer(SESSION)
+const alert = await waitFor((e) => typeof e.title === 'string' && e.title.includes('心跳已停止'), 30_000, 'T22 死信告警')
+check('到点自动投递告警（连"进程已退出"都能报）', alert !== null, '（等了 30 秒没等到）')
+check('告警带最后状态', typeof alert?.message === 'string' && alert.message.includes('最后状态'), JSON.stringify(alert?.message))
+check('告警响铃（priority 4）', alert?.priority === 4, `实际 ${alert?.priority}`)
+check('告警标题不带时长（"已停止"后面缀时长会误导）',
+  alert?.title === '🔴 DSH 心跳已停止', JSON.stringify(alert?.title))
+
+// 收尾：清掉这一轮的残留，并恢复默认心跳间隔。
+await bridge.finishHeartbeat(SESSION)
+bridge.config.defaults.heartbeatSec = 20
+seen.length = 0
+
+console.log('\nT26 空回复哨兵：ntfy 的空回复不该注入会话')
+// 真机反馈：在通知上点「回复」但不输入任何字，会收到一条正文为 triggered 的消息。
+// 它字段与普通消息一致，只能按字面量认；不拦的话会被注入会话并打断正在跑的回合。
+liveAgents.set(SESSION, {
+  id: SESSION,
+  session: { seq: 0, events: [] },
+  followup: (message) => followupCalls.push(message),
+  whenIdle: async () => {},
+})
+const beforeT26 = followupCalls.length
+await publish(SERVER_A, { topic: info.topic, message: 'triggered' })
+await delay(1500)
+check('triggered 不被注入会话', followupCalls.length === beforeT26,
+  `followup ${beforeT26} → ${followupCalls.length}`)
+// 紧接着发一条正常文本，证明通道本身是通的（不是"什么都没注入"碰巧成立）
+await publish(SERVER_A, { topic: info.topic, message: 'triggered 了这个 bug' })
+check('含该词的正常句子照常注入',
+  (await waitFor(() => followupCalls.length > beforeT26, 12_000, 'T26 正常注入')) !== null,
+  `followup ${beforeT26} → ${followupCalls.length}`)
+liveAgents.delete(SESSION)
+seen.length = 0
+
+console.log('\nT24 中止：状态通知吸收回执，不另推一条')
+// 真机反馈：点「停止」后话题里出现三条（我的 /stop + 状态 + 「已请求中止当前回合。」）。
+// 第三条是冗余的——状态通知收尾时会变成「⏹ DSH 已中止」，等于把话说完了。
+bridge.config.defaults.heartbeatSec = 5
+bridge.enable(SESSION)
+seen.length = 0
+let cancelCalled = false
+liveAgents.set(SESSION, { id: SESSION, cancel: () => { cancelCalled = true } })
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/start', data: { turn: 4 } })
+check('已起搏（心跳在跑）',
+  (await waitFor((e) => typeof e.title === 'string' && e.title.includes('思考中'), 10_000, 'T24 起搏')) !== null)
+seen.length = 0
+await publish(SERVER_A, { topic: info.topic, message: '/stop' })
+await delay(1500)
+check('确实调用了 agent.cancel', cancelCalled === true)
+check('心跳在跑时不再另推「已请求中止当前回合。」',
+  seen.every((e) => !String(e.message ?? '').includes('已请求中止')),
+  JSON.stringify(seen.map((e) => e.message)))
+// 回合被中止而结束
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/end', data: { reason: { kind: 'aborted' } } })
+const stopped = await waitFor((e) => typeof e.title === 'string' && e.title.includes('已中止'), 10_000, 'T24 已中止')
+check('状态通知显示「⏹ DSH 已中止」而不是「✅ 已完成」', stopped !== null, `实际 ${JSON.stringify(stopped?.title)}`)
+check('中止状态仍与心跳共用同一个 sequence_id', stopped?.sequence_id === ack?.sequence_id)
+liveAgents.delete(SESSION)
+
+console.log('\nT25 网页发起的回合：关掉开关后手机端完全静默')
+// 直接发 turn/start 而不走 executeTurn —— 这正是"网页/桌面发起"的特征（inflight 里没有它）。
+bridge.config.defaults.heartbeatSec = 5
+bridge.enable(SESSION)
+bridge.setPref(SESSION, 'notifyOnWebTurn', false)
+seen.length = 0
+bridge.lastAssistant.set(SESSION, 'T25-网页回合的回复')
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/start', data: { turn: 5 } })
+await delay(600)
+check('网页发起的回合不起心跳', !seen.some((e) => String(e.title ?? '').includes('思考中')),
+  JSON.stringify(seen.map((e) => e.title)))
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+await delay(1500)
+check('网页发起的回合不推回复', !seen.some((e) => String(e.message ?? '').includes('T25-网页回合的回复')),
+  JSON.stringify(seen.map((e) => e.message)))
+
+// 打开开关 → 同一路径应当照常推送（证明是开关在起作用，而不是别的什么挡住了）
+seen.length = 0
+bridge.setPref(SESSION, 'notifyOnWebTurn', true)
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/start', data: { turn: 6 } })
+check('打开开关后心跳照常', (await waitFor((e) => String(e.title ?? '').includes('思考中'), 10_000, 'T25 心跳')) !== null)
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+const webPushed = await waitFor((e) => String(e.message ?? '').includes('T25-网页回合的回复'), 10_000, 'T25 回复')
+check('打开开关后回复照常推送', webPushed !== null)
+
+// 手机发起的回合**不受**这个开关影响——它只拦网页发起的。
+// 模拟方式：先把 inflight 标记上（这正是 executeTurn 会做的事），再发 turn/start。
+seen.length = 0
+bridge.setPref(SESSION, 'notifyOnWebTurn', false)   // 开关仍然关着
+bridge.inflight.set(SESSION, 'm-test')
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/start', data: { turn: 7 } })
+const phoneHb = await waitFor((e) => String(e.title ?? '').includes('思考中'), 10_000, 'T25 手机回合心跳')
+check('开关关着，手机发起的回合照样起搏', phoneHb !== null)
+check('该回合被识别为手机回合', bridge.isPhoneTurn(SESSION) === true)
+bridge.inflight.delete(SESSION)
+await bridge.finishHeartbeat(SESSION)
+bridge.setPref(SESSION, 'notifyOnWebTurn', undefined)
+bridge.config.defaults.heartbeatSec = 20
+seen.length = 0
+
+console.log('\nT27 撤回：在 App 里删掉手机发出的消息 → 取消那一轮且不回推')
+// 真机场景：在手机上发一条，随即在 ntfy 里把它删掉（撤回）。ntfy 会广播 message_delete，
+// 桥接侧要能对上是哪一轮（用被删消息的 id，实测就是删除事件里的 sequence_id），
+// 中止仍在跑的那一轮，并且**不要**再把回复推回来——推回来就等于撤回没生效。
+seen.length = 0
+let releaseTurn = null
+const turnGate = new Promise((resolve) => { releaseTurn = resolve })
+let recallCancelled = false
+const recallInjected = []
+liveAgents.set(SESSION, {
+  id: SESSION,
+  session: {
+    seq: 0,
+    snapshotEvents: () => [
+      { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'T27-这轮已被撤回，不该推回来' }] } } },
+      { seq: 2, type: 'turn/end', data: { reason: { kind: 'completed' } } },
+    ],
+  },
+  followup: (message) => recallInjected.push(message),
+  whenIdle: () => turnGate,
+  cancel: () => { recallCancelled = true },
+})
+await publish(SERVER_A, { topic: info.topic, message: 'T27 这条消息稍后会被撤回' })
+const recallMsg = await waitFor((e) => e.message === 'T27 这条消息稍后会被撤回', 12_000, 'T27 发出')
+check('手机消息已注入会话', recallInjected.length === 1, `实际 ${recallInjected.length}`)
+const recallId = recallMsg?.id
+check('拿到那条消息在 ntfy 上的 id', typeof recallId === 'string' && recallId !== '', JSON.stringify(recallId))
+
+// 在 App 里删掉它。DELETE 会让服务器向所有订阅者广播 message_delete。
+const recallDelete = await removeMessage(SERVER_A, info.topic, recallId)
+check('删除请求成功（DELETE 命中那条消息）', recallDelete.ok === true, JSON.stringify(recallDelete))
+await delay(1500)
+check('撤回被认领（retracted = true）', bridge.phoneInjects.get(recallId)?.retracted === true,
+  JSON.stringify(bridge.phoneInjects.get(recallId)))
+check('撤回顺带中止了仍在跑的那一轮', recallCancelled === true)
+
+// 放行回合：被撤回的一轮即使跑完了，也不能把回复推回手机。
+releaseTurn?.()
+await delay(2500)
+check('被撤回的一轮不回推回复',
+  !seen.some((e) => String(e.message ?? '').includes('T27-这轮已被撤回')),
+  JSON.stringify(seen.map((e) => e.message)))
+liveAgents.delete(SESSION)
+seen.length = 0
+
+console.log('\nT23 优雅停止：热重载/退出时要撤掉死信开关，别留假告警')
+// stop() 会清掉定时器，但那条**挂在 ntfy 服务器上**的定时告警还在。若不当场撤销，
+// 3×心跳间隔后它会自己投递，变成一条假的「心跳已停止」——真机踩过：开发期改文件
+// 触发热重载，50 秒后手机收到一条假的 🔴（用户会看到两条通知：🟢 状态 + 🔴 假告警，
+// 因为两者 sequence_id 不同）。
+// 注意这个遗漏恰好**不伤真正的故障**：进程崩溃时 stop() 根本不会执行，开关留在
+// 服务器上照样会响。所以"撤"这个动作本身就区分了「优雅停止」与「崩溃」。
+seen.length = 0
+bridge.config.defaults.heartbeatSec = 5
+bridge.enable(SESSION)
+bridge.onSessionEvent({ id: SESSION }, { type: 'turn/start', data: { turn: 3 } })
+check('已起搏（死信开关随之挂上）',
+  (await waitFor((e) => typeof e.title === 'string' && e.title.includes('思考中'), 10_000, 'T23 起搏')) !== null)
+seen.length = 0
+bridge.stop()   // 优雅停止 ≈ 热重载/退出
+const falseAlert = await waitFor(
+  (e) => typeof e.title === 'string' && e.title.includes('心跳已停止'), 22_000, 'T23 假告警')
+check('优雅停止后不会冒出假的「心跳已停止」',
+  falseAlert === null, `却收到了：${JSON.stringify(falseAlert?.title)}`)
+
 observer.stop()
 
 console.log(failed === 0 ? '\n集成测试全部通过' : `\n${failed} 个用例失败`)

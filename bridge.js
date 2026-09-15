@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto'
 const VERSION = new URL(import.meta.url).search
 const { createStateSaver, findServer, rememberId } = await import(`./config.js${VERSION}`)
 const { describeError, log } = await import(`./log.js${VERSION}`)
-const { MAX_CATCHUP_SEC, NTFY_MESSAGE_MAX_BYTES, createSubscriber, normalizeServer, publish } = await import(`./ntfy.js${VERSION}`)
+const { MAX_CATCHUP_SEC, NTFY_MESSAGE_MAX_BYTES, createSubscriber, normalizeServer, publish, removeMessage } = await import(`./ntfy.js${VERSION}`)
 const { parseNtfyMessage, shortSessionId, topicFor, topicUrl } = await import(`./topics.js${VERSION}`)
 
 /** 核对「已开启桥接的会话是否还存在」的周期。 */
@@ -40,6 +40,14 @@ const ASSISTANT_CACHE_LIMIT = 200
 const MAX_ACTION_BUTTONS = 3
 
 /**
+ * 多选的「提交」按钮标签。
+ *
+ * 多选没法靠按钮直接表达结果（按钮是无状态单次回执），所以改用「点选项切换选中
+ * + 点提交收尾」两步。这个标签也是桥接侧识别提交动作的文案，测试会引用它。
+ */
+const SUBMIT_LABEL = '提交'
+
+/**
  * 单条正文的默认字节预算。
  *
  * ntfy 的硬上限是 4095 字节（4096 会被 HTTP 500 拒收，见 ntfy.js 的
@@ -50,6 +58,177 @@ const DEFAULT_CHUNK_BYTES = 4000
 
 /** 分片预算的绝对下限；配置被填成 1 之类时不至于切出成千上万条。 */
 const MIN_CHUNK_BYTES = 256
+
+// ── 回合心跳 ──────────────────────────────────────────────────────────────
+//
+// 目的：手机发出一条消息后，用户要知道「DSH 到底在思考、卡住了、还是已经断了」。
+//
+// 两个机制配合，且**不需要额外进程**：
+//   1. 状态通知——同一个 sequence_id 反复原地更新，手机上始终只有一条，秒数自己在走。
+//      它由本进程的定时器驱动，所以「秒数冻住」= 进程/事件循环出了问题。
+//   2. 死信开关——一条 `delay` 定时消息挂在 **ntfy 服务器**上，每拍往后推。进程死了
+//      就没人推，服务器到点自动投递告警。这一条连「进程已退出」都能报出来，是客户端
+//      心跳做不到的。
+//
+// 三个时间只暴露一个：心跳间隔 `a`。另外两个按固定倍数推导，避免用户填出互相矛盾的
+// 组合（例如心跳 60 秒、死信 30 秒 → 健康时就误报）。
+
+/** 心跳间隔的默认值（秒）。 */
+export const HEARTBEAT_DEFAULT_SEC = 20
+
+/** 心跳间隔的允许范围（秒）。下限 5：死信超时 = 3a 必须 ≥ ntfy 定时消息的最小 delay 10 秒。 */
+export const HEARTBEAT_MIN_SEC = 5
+export const HEARTBEAT_MAX_SEC = 300
+
+/** 死信超时 = 心跳间隔 × 此倍数（默认 20s → 60s）。 */
+const WATCHDOG_FACTOR = 3
+
+/** 疑似卡住阈值 = 心跳间隔 × 此倍数（默认 20s → 180s）。要大于死信超时，否则来不及报。 */
+const STUCK_FACTOR = 9
+
+/** 算作「有进展」的会话事件。模型调工具期间不该被误判成卡住。 */
+const PROGRESS_EVENT_TYPES = new Set(['assistant/message', 'tool/call', 'tool/result', 'step/end'])
+
+/**
+ * ntfy 安卓端「内联回复」提交**空内容**时发来的哨兵串。
+ *
+ * 实测：在通知上点「回复」但一个字都不输入，话题里会收到一条正文正好是 `triggered`
+ * 的消息。它的字段与普通消息**完全一致**（没有 tag、没有 title、priority 同样是 3），
+ * 无法从元数据区分，只能按字面量认。
+ *
+ * 不处理的后果不只是"多一条垃圾输入"：它还会被当成用户消息注入会话，顺手把正在跑的
+ * 回合打断（真机实测：一条 triggered 让上一轮 4 秒后中止，并推了一条「回合中断：unknown」）。
+ *
+ * 代价：你如果真想发 `triggered` 这个词，会被吞掉。中文使用场景下可以接受，而且这里
+ * **记日志**而不是静默丢弃。
+ */
+const EMPTY_REPLY_SENTINEL = 'triggered'
+
+/**
+ * 判断一条入站正文是不是那个「空回复」哨兵。
+ *
+ * @param {unknown} text 入站正文
+ * @returns {boolean}
+ */
+export function isEmptyReplySentinel(text) {
+  return String(text ?? '').trim().toLowerCase() === EMPTY_REPLY_SENTINEL
+}
+
+/**
+ * 状态通知的展示标签。
+ *
+ * 注意它**不能替代** MARKER_TAG：那个是回声过滤的主防线——插件订阅了自己发布的话题，
+ * 服务器会把消息原样推回来，靠标记才能认出"这是我自己发的"而不当作用户输入注入会话。
+ * 所以两个 tag 并存，这个只负责在手机上显示成一个人能看懂的标签。
+ */
+const STATUS_TAG = 'dsh状态通知'
+
+/**
+ * 状态通知上那个中止按钮的**显示文字**。
+ *
+ * 按钮文案和点击后发回话题的内容是两回事：这里显示中文「停止」，点击仍然发
+ * `/stop` —— 走的还是既有的文本指令通道，不需要新命令，用户在话题里手打
+ * `/stop` 也照样有效。中文只出现在 JSON body 里，不受 HTTP 头非 ASCII 的限制。
+ */
+const STOP_LABEL = '停止'
+
+/**
+ * 把心跳间隔钳到允许范围；非法值回落默认。
+ *
+ * @param {unknown} value 原始值（秒）
+ * @returns {number}
+ */
+export function clampHeartbeatSec(value) {
+  // 空值必须走默认，不能依赖 Number()——Number(null) 与 Number('') 都是 0，
+  // 会被钳成下限 5，把「没填」误解成「要最灵敏」。
+  if (value === null || value === undefined || value === '') return HEARTBEAT_DEFAULT_SEC
+  const raw = Number(value)
+  if (!Number.isFinite(raw)) return HEARTBEAT_DEFAULT_SEC
+  return Math.max(HEARTBEAT_MIN_SEC, Math.min(HEARTBEAT_MAX_SEC, Math.floor(raw)))
+}
+
+/**
+ * 由心跳间隔推导出两个派生时间。
+ *
+ * 公式集中在这里，避免调用方各算一遍、算出不一致的组合。
+ *
+ * @param {unknown} value 心跳间隔（秒）
+ * @returns {{intervalSec: number, watchdogSec: number, stuckSec: number}}
+ */
+export function heartbeatTimings(value) {
+  const intervalSec = clampHeartbeatSec(value)
+  return {
+    intervalSec,
+    watchdogSec: intervalSec * WATCHDOG_FACTOR,
+    stuckSec: intervalSec * STUCK_FACTOR,
+  }
+}
+
+/**
+ * 把秒数说成人话：`45 秒` / `1 分 20 秒` / `3 分`。
+ *
+ * @param {number} sec 秒数
+ * @returns {string}
+ */
+export function formatDuration(sec) {
+  const total = Math.max(0, Math.round(Number(sec) || 0))
+  if (total < 60) return `${total} 秒`
+  const minutes = Math.floor(total / 60)
+  const rest = total % 60
+  return rest === 0 ? `${minutes} 分` : `${minutes} 分 ${rest} 秒`
+}
+
+/**
+ * 五种状态各自的表情与措辞。
+ *
+ * `cancelled` 与 `done` 分开是有意的：中止后如果显示「✅ 已完成」会误导，而且它还要
+ * 顺带承担「已收到你的中止请求」这句回执——见 runTextCommand('stop') 里为什么不另推。
+ */
+const STATUS_PHASES = {
+  running: { icon: '🟢', text: '思考中' },
+  stuck: { icon: '🟠', text: '疑似卡住' },
+  done: { icon: '✅', text: '已完成' },
+  cancelled: { icon: '⏹', text: '已中止' },
+  lost: { icon: '🔴', text: '心跳已停止' },
+}
+
+/**
+ * 构造状态通知的标题与正文。
+ *
+ * 用四种颜色区分状态，正文里带上「最近一次输出」——这是区分
+ * 「秒数在走且真的在干活」与「秒数在走但一直没输出」的关键。
+ *
+ * @param {{phase: keyof typeof STATUS_PHASES, elapsedSec: number, progressAgeSec?: number, watchdogSec?: number, lastTitle?: string}} state 状态
+ * @returns {{title: string, body: string}}
+ */
+export function buildStatusMessage(state) {
+  const phase = STATUS_PHASES[state.phase] ?? STATUS_PHASES.running
+  const elapsed = formatDuration(state.elapsedSec)
+  // 「心跳已停止」是死信开关发出的告警，它不再随心跳更新，所以标题不缀时长——
+  // 缀上会读成"已停止 1 分 20 秒"，容易误解成停了这么久。冻结前的时长放在正文里。
+  const title = state.phase === 'lost'
+    ? `${phase.icon} DSH ${phase.text}`
+    : `${phase.icon} DSH ${phase.text} · ${elapsed}`
+
+  const lines = []
+  if (state.phase === 'done') {
+    lines.push(`本轮用时 ${elapsed}。`)
+  } else if (state.phase === 'cancelled') {
+    lines.push(`本轮在 ${elapsed}时被中止。`)
+  } else if (state.phase === 'lost') {
+    lines.push(`已经超过 ${formatDuration(state.watchdogSec ?? 0)} 没有收到心跳，DSH 可能已卡死或已退出。`)
+    if (typeof state.lastTitle === 'string' && state.lastTitle !== '') {
+      lines.push(`最后状态：${state.lastTitle}`)
+    }
+  } else {
+    const age = Number(state.progressAgeSec)
+    lines.push(Number.isFinite(age) ? `最近一次输出：${formatDuration(age)}前` : '本轮还没有输出。')
+    if (state.phase === 'stuck') {
+      lines.push('', `已经 ${formatDuration(age)} 没有任何输出。点下面的「${STOP_LABEL}」按钮可以中止本轮。`)
+    }
+  }
+  return { title, body: lines.join('\n') }
+}
 
 /**
  * 围栏修复给单片追加的最大字节数。
@@ -86,6 +265,15 @@ const OWN_TEXT_MEMORY = 12
  * 加时间窗是为了防止一次没等到 `turn/end` 的取消，吞掉之后真正的异常中断。
  */
 const CANCEL_QUIET_MS = 60_000
+
+/**
+ * 「ntfy 消息 → 注入出来的 DSH 消息」这张表最多记多少条。
+ *
+ * 每条手机消息都往里塞一条，而它只在**撤回**时才被查到（用户在 App 里删掉那条
+ * 消息）。不设上限它会随使用一直涨（插件是常驻进程）；Map 保持插入顺序，超限
+ * 就从最旧的一端丢——要撤回的总是刚发出去的那条，旧记录丢掉无妨。
+ */
+const INJECT_MEMORY_LIMIT = 200
 
 /**
  * 进程内「当前有效实例」的世代号。
@@ -362,6 +550,21 @@ export function splitForNtfy(text, limitBytes = DEFAULT_CHUNK_BYTES) {
 }
 
 /**
+ * 判断一条入站消息是不是**结构化回执**（按钮点击 / 多选切换 / 提交）。
+ *
+ * 判据：带 `requestId`，且带任一决策字段。用意是把「按钮回执」和「用户手打的
+ * 普通文本」区分开——过期回执必须丢弃，绝不能被当成用户消息注入会话。
+ *
+ * @param {any} payload 解析后的入站载荷
+ * @returns {boolean}
+ */
+export function isDecisionPayload(payload) {
+  if (payload === null || typeof payload !== 'object') return false
+  if (typeof payload.requestId !== 'string' || payload.requestId === '') return false
+  return ['answer', 'approved', 'toggle', 'submit', 'selected'].some((key) => key in payload)
+}
+
+/**
  * 构造 ntfy 动作按钮。
  *
  * 服务器启用鉴权时，按钮必须自带 Authorization 头：ntfy 的动作按钮是**手机直接**
@@ -388,6 +591,34 @@ export function buildActionButtons(server, topic, requestId, buttons) {
     headers,
     body: JSON.stringify({ requestId, ...button.value }),
   }))
+}
+
+/**
+ * 构造一个「把一段文本发回本话题」的动作按钮（用于 `/stop` 这类控制）。
+ *
+ * 与 {@link buildActionButtons} 的区别：那个发的是带 `requestId` 的结构化回执、
+ * 由待决请求结算；这个只是把一段普通文本丢回话题，走既有的文本指令通道——
+ * 也就是说它和用户在话题里手打 `/stop` 完全等价，不需要新的载荷类型。
+ *
+ * @param {{url: string, token?: string}} server 服务器描述符
+ * @param {string} topic 话题
+ * @param {string} label 按钮文案
+ * @param {string} text 点击后发回话题的文本
+ * @returns {object} ntfy action
+ */
+export function buildTextAction(server, topic, label, text) {
+  const headers = typeof server?.token === 'string' && server.token !== ''
+    ? { Authorization: `Bearer ${server.token}` }
+    : undefined
+  return {
+    action: 'http',
+    label,
+    url: `${normalizeServer(server.url)}/${topic}`,
+    method: 'POST',
+    clear: false,
+    headers,
+    body: text,
+  }
 }
 
 /**
@@ -426,30 +657,46 @@ export function buildQuestionParts(question, options, position) {
 
   const parts = [{ message: head.join('\n') }]
 
-  // 编号跨组连续；matchOption 按整份 options 的数字下标还原，所以分组不影响作答。
-  for (let start = 0; start < options.length; start += MAX_ACTION_BUTTONS) {
-    const items = options.slice(start, start + MAX_ACTION_BUTTONS)
-    const lines = items.map((option, offset) => {
-      const text = `${start + offset + 1}. ${String(option?.label ?? '')}`
+  // 分组。编号跨组连续；matchOption 按整份 options 的数字下标还原，所以分组不影响作答。
+  //
+  // 多选走「切换 + 提交」：ntfy 的按钮是无状态的单次回执，点第二个只会多出一条
+  // 互不相关的回执，表达不了「选中的集合」。所以改成每次点击切换一个选项的选中
+  // 状态（桥接侧累积），最后用「提交」收尾。最后一组要腾出一个按钮位给「提交」，
+  // 因此它最多只放 2 个选项（MAX_ACTION_BUTTONS - 1）。
+  const groups = []
+  if (multi) {
+    for (let i = 0; i < options.length;) {
+      const remaining = options.length - i
+      const size = remaining <= MAX_ACTION_BUTTONS ? Math.min(remaining, MAX_ACTION_BUTTONS - 1) : MAX_ACTION_BUTTONS
+      groups.push({ start: i, items: options.slice(i, i + size) })
+      i += size
+    }
+  } else {
+    for (let i = 0; i < options.length; i += MAX_ACTION_BUTTONS) {
+      groups.push({ start: i, items: options.slice(i, i + MAX_ACTION_BUTTONS) })
+    }
+  }
+
+  groups.forEach((group, groupIndex) => {
+    const lines = group.items.map((option, offset) => {
+      const text = `${group.start + offset + 1}. ${String(option?.label ?? '')}`
       const description = typeof option?.description === 'string' ? option.description.trim() : ''
       // 缩进 3 格：md 里算上一项的续行，渲染出来就贴在标签下面。
       return description === '' ? text : `${text}\n   ${description}`
     })
-    const last = start + MAX_ACTION_BUTTONS >= options.length
+    const last = groupIndex === groups.length - 1
     if (last) {
       lines.push('', multi
-        ? '多选：回复编号或标签，逗号分隔（例如 1,3）；也可以直接打字。'
+        ? '点选项按钮可以选中 / 再点取消，选好后点「提交」；也可以直接回复编号（如 1,3）。'
         : '点按钮，或回复编号 / 标签；也可以直接打字。')
     }
-    parts.push({
-      message: lines.join('\n'),
-      // 多选不能用按钮：按钮是无状态的单次回执，点第二个只会多出一条回执，
-      // 表达不了「选中的集合」。所以多选一律走编号 / 标签文本作答。
-      buttons: multi
-        ? undefined
-        : items.map((option) => ({ label: String(option?.label ?? ''), value: { answer: option?.label } })),
-    })
-  }
+    const buttons = group.items.map((option) => ({
+      label: String(option?.label ?? ''),
+      value: multi ? { toggle: option?.label } : { answer: option?.label },
+    }))
+    if (multi && last) buttons.push({ label: SUBMIT_LABEL, value: { submit: true } })
+    parts.push({ message: lines.join('\n'), buttons })
+  })
 
   return parts
 }
@@ -469,16 +716,25 @@ export class Bridge {
     this.generation = generation
     /** @type {Map<string, string>} sessionId → 最近一条 assistant 文本 */
     this.lastAssistant = new Map()
-    /** @type {Map<string, {sessionId: string, kind: string, finish: (value: any) => void}>} requestId → 待决请求 */
+    /** @type {Map<string, {sessionId: string, kind: string, finish: (value: any) => void, selected: Set<string>}>} requestId → 待决请求（selected 供多选累积） */
     this.pending = new Map()
-    /** @type {Set<string>} 正在被手机发起的续聊驱动的会话 */
-    this.inflight = new Set()
+    /** @type {Map<string, string>} sessionId → 正在跑的那条手机消息的 id（见 executeTurn） */
+    this.inflight = new Map()
+    /**
+     * @type {Map<string, {sessionId: string, messageId: string, retracted: boolean}>}
+     * ntfy 消息 id → 它注入出来的 DSH 消息。
+     *
+     * 用来对上「用户在 App 里删掉的那条」和「DSH 里对应的那条」——撤回功能全靠这张表。
+     */
+    this.phoneInjects = new Map()
     /** @type {Map<string, number>} sessionId → 手机最近一次 /stop 的时刻（用于压掉随之而来的中断推送） */
     this.phoneCancels = new Map()
     /** @type {Map<string, {sessionId: string, serverId: string}>} 话题 → 归属 */
     this.topicIndex = new Map()
     /** @type {Map<string, string[]>} sessionId → 最近推送过的正文，用于回环兜底 */
     this.recentOwn = new Map()
+    /** @type {Map<string, {startedAt: number, lastProgressAt: number, stuck: boolean, timer: any}>} sessionId → 回合心跳状态 */
+    this.heartbeats = new Map()
     /** @type {Map<string, number>} sessionId → 连续核对不到的次数 */
     this.missingSweeps = new Map()
     this.sweepTimer = null
@@ -646,6 +902,23 @@ export class Bridge {
       clearTimeout(this.sweepDebounce)
       this.sweepDebounce = null
     }
+    // 撤掉所有已挂上的死信开关。**这一步不能省**：热重载或优雅退出时如果不撤，
+    // 那条挂在服务器上的定时告警会在几十秒后自己响起来，报一个假的「心跳已停止」
+    // ——实测：开发期改文件触发热重载，50 秒后手机收到一条假的 🔴。
+    //
+    // 而这个遗漏恰好不伤真正的故障场景：进程崩溃时 stop() 根本不会执行，
+    // 开关留在服务器上，照样会响。所以「撤」这个动作本身就区分了两者。
+    for (const [sessionId, hb] of this.heartbeats) {
+      if (hb.timer !== null) clearInterval(hb.timer)
+      const server = this.serverFor(sessionId)
+      const binding = this.state.sessions[sessionId]
+      if (server !== null && binding !== undefined) {
+        // 尽力而为：进程若是马上就要退出，这条 HTTP 可能来不及发完；
+        // 那时最坏的结果是又响一次告警，比"该响不响"安全。
+        void removeMessage(server, binding.topic, this.watchdogSequence(sessionId)).catch(() => {})
+      }
+    }
+    this.heartbeats.clear()
     for (const subscriber of this.subscribers.values()) subscriber.stop()
     this.subscribers.clear()
     this.saver.flush()
@@ -858,6 +1131,7 @@ export class Bridge {
     if (info === undefined) return { ok: false, error: 'not-bound' }
     if (info.enabled === true) return { ok: false, error: 'still-enabled' }
     delete this.state.sessions[sessionId]
+    this.dropHeartbeat(sessionId)
     this.resync()
     log(`bridge: 已解绑 ${sessionId}`)
     return { ok: true }
@@ -879,6 +1153,7 @@ export class Bridge {
     this.missingSweeps.delete(sessionId)
     this.lastAssistant.delete(sessionId)
     this.recentOwn.delete(sessionId)
+    this.dropHeartbeat(sessionId)
     this.resync()
     log(`bridge: 已移除会话 ${sessionId} 的记录`)
     return true
@@ -894,6 +1169,7 @@ export class Bridge {
     const info = this.state.sessions[sessionId]
     if (info === undefined) return false
     info.enabled = false
+    this.dropHeartbeat(sessionId)
     this.resync()
     log(`bridge: 关闭 ${sessionId}`)
     return true
@@ -1067,6 +1343,231 @@ export class Bridge {
     })
   }
 
+  // ── 回合心跳 ──────────────────────────────────────────────────────────
+  //
+  // 见文件顶部「回合心跳」的说明。要点：状态通知按每会话一个 sequence_id **原地更新**
+  // （手机上始终一条，不刷屏）；死信开关挂在 ntfy 服务器上，进程死了它也能报。
+
+  /**
+   * 这一轮是不是从**手机**发起的。
+   *
+   * 手机发来的文本一律走 executeTurn，它在注入前后标记 `inflight`；桌面 / 网页发起的
+   * 回合没有这个标记。所以这里不需要去解析消息的 `source`——虽然它也确实带 `rpcId`
+   * 可以事后区分（网页发的有 rpcId，插件自己注入的没有）。
+   *
+   * @param {string} sessionId 会话 id
+   * @returns {boolean}
+   */
+  isPhoneTurn(sessionId) {
+    return this.inflight.has(sessionId)
+  }
+
+  /**
+   * 网页 / 桌面发起的回合要不要通知手机（逐会话，默认要）。
+   *
+   * 关掉后只有手机发起的回合才会推回复与心跳——代价是放弃「在电脑上发起长任务、
+   * 走开后手机收结果」这个场景，所以是开关而不是默认行为。
+   *
+   * @param {string} sessionId 会话 id
+   * @returns {boolean}
+   */
+  notifyWebTurn(sessionId) {
+    // 判据是「**没有显式关掉**」，不是「显式打开」：这个键是后加的，缺省必须是推送。
+    // 反过来写（=== true）会让任何没有该键的配置静默掐掉全部通知——测试夹具就踩过。
+    return this.pref(sessionId, 'notifyOnWebTurn') !== false
+  }
+
+  /** 心跳间隔（秒），已钳到允许范围。 */
+  heartbeatSec() {
+    return clampHeartbeatSec(this.config.defaults.heartbeatSec)
+  }
+
+  /** 状态通知的 sequence id。每会话一个 ⇒ 同一会话永远只有一条状态通知，不会累积。 */
+  statusSequence(sessionId) {
+    return `dsh-turn-${shortSessionId(sessionId)}`
+  }
+
+  /** 死信开关的 sequence id（同样每会话一个）。 */
+  watchdogSequence(sessionId) {
+    return `dsh-watch-${shortSessionId(sessionId)}`
+  }
+
+  /**
+   * 回合开始：发第一条状态通知（也就是 ACK）+ 挂死信开关 + 起定时器。
+   *
+   * @param {string} sessionId 会话 id
+   */
+  startHeartbeat(sessionId) {
+    if (!this.isCurrent() || !this.isEnabled(sessionId)) return
+    // 网页 / 桌面发起的回合，而该会话关掉了「网页发起的回合也推送」→ 心跳也不起。
+    if (!this.isPhoneTurn(sessionId) && !this.notifyWebTurn(sessionId)) return
+    if (this.serverFor(sessionId) === null) return
+
+    // 同一个会话可能连续两个回合；先把上一个定时器清掉，避免叠加。
+    this.stopHeartbeatTimer(sessionId)
+    const now = Date.now()
+    const hb = { startedAt: now, lastProgressAt: now, stuck: false, timer: null }
+    this.heartbeats.set(sessionId, hb)
+
+    const { intervalSec, watchdogSec, stuckSec } = heartbeatTimings(this.heartbeatSec())
+    hb.timer = setInterval(() => {
+      void this.heartbeatTick(sessionId, { first: false }).catch((error) => {
+        log(`heartbeat: 节拍失败 ${describeError(error)}`)
+      })
+    }, intervalSec * 1000)
+    // 心跳定时器不该阻止进程退出。
+    hb.timer.unref?.()
+
+    log(`heartbeat: ${sessionId} 起搏（心跳 ${intervalSec}s / 死信 ${watchdogSec}s / 卡住 ${stuckSec}s）`)
+    void this.heartbeatTick(sessionId, { first: true }).catch((error) => {
+      log(`heartbeat: 首拍失败 ${describeError(error)}`)
+    })
+  }
+
+  /**
+   * 记一次进展，并解除「疑似卡住」。
+   *
+   * @param {string} sessionId 会话 id
+   */
+  touchHeartbeat(sessionId) {
+    const hb = this.heartbeats.get(sessionId)
+    if (hb === undefined) return
+    hb.lastProgressAt = Date.now()
+  }
+
+  /**
+   * 只停定时器，保留状态（收尾时还要用 startedAt 算总时长）。
+   *
+   * @param {string} sessionId 会话 id
+   */
+  stopHeartbeatTimer(sessionId) {
+    const hb = this.heartbeats.get(sessionId)
+    if (hb === undefined || hb.timer === null) return
+    clearInterval(hb.timer)
+    hb.timer = null
+  }
+
+  /**
+   * 直接丢弃某会话的心跳（停表 + 清状态），**不发任何通知**。
+   *
+   * 用于会话被关闭 / 解绑 / 删除记录——这时再去更新状态通知没有意义，还可能
+   * 往一个已经不归我们管的话题里发东西。
+   *
+   * @param {string} sessionId 会话 id
+   */
+  dropHeartbeat(sessionId) {
+    const hb = this.heartbeats.get(sessionId)
+    if (hb === undefined) return
+    if (hb.timer !== null) clearInterval(hb.timer)
+    this.heartbeats.delete(sessionId)
+  }
+
+  /**
+   * 一次心跳节拍：原地更新状态通知 + 把死信开关往后推。
+   *
+   * @param {string} sessionId 会话 id
+   * @param {{first: boolean}} options first=true 表示回合开始的第一条（响一声，充当 ACK）
+   */
+  async heartbeatTick(sessionId, options) {
+    if (!this.isCurrent()) return
+    const hb = this.heartbeats.get(sessionId)
+    const binding = this.state.sessions[sessionId]
+    const server = this.serverFor(sessionId)
+    if (hb === undefined || binding === undefined || server === null) return
+
+    const now = Date.now()
+    const elapsedSec = (now - hb.startedAt) / 1000
+    const progressAgeSec = (now - hb.lastProgressAt) / 1000
+    const { watchdogSec, stuckSec } = heartbeatTimings(this.heartbeatSec())
+
+    const stuck = progressAgeSec >= stuckSec
+    if (stuck !== hb.stuck) {
+      hb.stuck = stuck
+      log(`heartbeat: ${sessionId} ${stuck ? '疑似卡住' : '恢复正常'}（无输出 ${Math.round(progressAgeSec)}s）`)
+    }
+
+    const status = buildStatusMessage({
+      phase: stuck ? 'stuck' : 'running',
+      elapsedSec,
+      progressAgeSec,
+    })
+    // 第一条响一声（ACK——用户最想立刻知道"收到了"）；之后静音。
+    // 疑似卡住升级到 4，因为它需要你采取行动。
+    const priority = options.first ? 3 : (stuck ? 4 : 1)
+
+    // ① 原地更新状态通知。同一个 sequence_id ⇒ 客户端替换上一条，不刷屏。
+    await publish(server, {
+      topic: binding.topic,
+      sequenceId: this.statusSequence(sessionId),
+      title: status.title,
+      message: status.body,
+      priority,
+      tags: [MARKER_TAG, STATUS_TAG],
+      // /stop 按钮等价于在话题里手打 /stop，不需要新的载荷类型。
+      actions: [buildTextAction(server, binding.topic, STOP_LABEL, '/stop')],
+      markdown: true,
+    })
+
+    // ② 重新武装死信开关：把投递时间再往后推 watchdogSec。这一步**不产生任何通知**
+    //    （消息还没到投递时间）。进程一旦死掉，没人再推，服务器就会按最后的时间投递。
+    const lost = buildStatusMessage({
+      phase: 'lost',
+      elapsedSec,
+      watchdogSec,
+      lastTitle: status.title,
+    })
+    await publish(server, {
+      topic: binding.topic,
+      sequenceId: this.watchdogSequence(sessionId),
+      title: lost.title,
+      message: lost.body,
+      priority: 4,
+      tags: [MARKER_TAG, 'rotating_light'],
+      delay: `${watchdogSec}s`,
+      markdown: true,
+    })
+  }
+
+  /**
+   * 回合收尾：把状态通知原地更新成 ✅，并**撤掉死信开关**。
+   *
+   * 撤掉死信开关不能省——否则告警会在回合结束若干秒后突然响起来。
+   *
+   * @param {string} sessionId 会话 id
+   * @param {{cancelled?: boolean}} [outcome] cancelled=true 表示本轮是被中止的（显示「⏹ 已中止」）
+   */
+  async finishHeartbeat(sessionId, outcome = {}) {
+    const hb = this.heartbeats.get(sessionId)
+    if (hb === undefined) return
+    this.stopHeartbeatTimer(sessionId)
+    this.heartbeats.delete(sessionId)
+
+    const binding = this.state.sessions[sessionId]
+    const server = this.serverFor(sessionId)
+    if (binding === undefined || server === null) return
+
+    const elapsedSec = (Date.now() - hb.startedAt) / 1000
+    const status = buildStatusMessage({ phase: outcome.cancelled === true ? 'cancelled' : 'done', elapsedSec })
+    try {
+      // 收尾要发两条 HTTP，这期间用户可能已经连发下一条消息、新回合已经起搏了。
+      // 那就别再写 ✅ ——否则会把新回合的 🟢 盖掉（虽然后面一拍会纠正，但没必要）。
+      if (this.heartbeats.has(sessionId)) return
+      await publish(server, {
+        topic: binding.topic,
+        sequenceId: this.statusSequence(sessionId),
+        title: status.title,
+        message: status.body,
+        priority: 3,
+        tags: [MARKER_TAG, STATUS_TAG],
+        markdown: true,
+      })
+      await removeMessage(server, binding.topic, this.watchdogSequence(sessionId))
+      log(`heartbeat: ${sessionId} 收尾${outcome.cancelled === true ? '（已中止）' : ''}（${Math.round(elapsedSec)}s），已更新状态并撤掉死信开关`)
+    } catch (error) {
+      log(`heartbeat: 收尾失败 ${describeError(error)}`)
+    }
+  }
+
   /**
    * 记住刚推送出去的正文，作为「自己回自己」的第二道兜底。
    *
@@ -1125,16 +1626,39 @@ export class Bridge {
    */
   onSessionEvent(session, event) {
     if (!this.isCurrent()) return
+    const sessionId = session.id
+    // 子 agent 的回合既不该推送、也不该扰动心跳：一个父回合会因为子 agent 的事件
+    // 被误判成"一直有进展"，反而掩盖真正的卡死。
+    const subagent = session.header?.parentSession !== undefined || session.header?.origin === 'subagent'
+
+    // 回合心跳：所有回合都参与（含电脑发起的）。状态通知与死信开关见 startHeartbeat。
+    if (!subagent) {
+      if (event?.type === 'turn/start') {
+        this.startHeartbeat(sessionId)
+      } else if (PROGRESS_EVENT_TYPES.has(event?.type)) {
+        this.touchHeartbeat(sessionId)
+      } else if (event?.type === 'turn/end') {
+        // 这里只**窥看**phoneCancels、不消费：下面原有的推送抑制逻辑还要用它
+        // （consumePhoneCancel 会把它删掉，所以不能提前吃掉）。
+        const cancelled = isUserInitiatedCancel(event.data?.reason) || this.phoneCancels.has(sessionId)
+        // 收尾不能 await：这个处理器是同步的，而收尾要发两条 HTTP。
+        void this.finishHeartbeat(sessionId, { cancelled })
+          .catch((error) => log(`heartbeat: 收尾异常 ${describeError(error)}`))
+      }
+    }
+
     if (event?.type === 'assistant/message') {
-      this.rememberAssistant(session.id, event.data?.message)
+      this.rememberAssistant(sessionId, event.data?.message)
       return
     }
     if (event?.type !== 'turn/end') return
 
-    const sessionId = session.id
     if (!this.isEnabled(sessionId)) return
     // 子 agent 的回合也会触发 turn/end；一并推送会把手机刷爆。
-    if (session.header?.parentSession !== undefined || session.header?.origin === 'subagent') return
+    if (subagent) return
+    // 网页 / 桌面发起的回合，且该会话关掉了「网页发起的回合也推送」→ 整轮都不发
+    // （回复、错误、中断一律静默）。
+    if (!this.isPhoneTurn(sessionId) && !this.notifyWebTurn(sessionId)) return
     // 手机续聊那一轮的回复由 executeTurn 推回，这里不能再推一次。
     if (this.inflight.has(sessionId)) return
 
@@ -1160,6 +1684,65 @@ export class Bridge {
   }
 
   /**
+   * 限制「ntfy 消息 → 注入出来的 DSH 消息」这张表的大小。
+   *
+   * 每条手机消息都会往里塞一条记录，而它只在撤回时才被读到。Map 保持插入顺序，
+   * 所以超限时从最旧的一端丢（见 {@link INJECT_MEMORY_LIMIT}）。
+   */
+  pruneInjects() {
+    while (this.phoneInjects.size > INJECT_MEMORY_LIMIT) {
+      const oldest = this.phoneInjects.keys().next().value
+      this.phoneInjects.delete(oldest)
+    }
+  }
+
+  /**
+   * 处理一条**撤回**事件：用户在 ntfy App 里删掉了某条消息。
+   *
+   * 对号要用 `sequence_id`，**不能用 `id`**。实测（ntfy 2.x，自建服务器）：
+   *   - 消息发布时带了 `sequence_id` → 删除事件里就是那个值；
+   *   - 消息没带（手机手打的普通消息都是这种）→ ntfy 把**被删消息自己的 id**
+   *     填进 `sequence_id`；
+   *   - 而删除事件的 `id` 是**它自己**的新 id，与被删的那条无关。
+   * 所以 `sequence_id` 才是「被删消息的标识」，它正好等于桥接侧记的 `originId`
+   * （入站消息的 `event.id`，见 executeTurn）。
+   *
+   * 撤回的语义是「那条消息不算数了」。它不是用户输入（绝不能落到文本分支），
+   * 而是把那一轮取消掉：
+   *   1. 标记 `retracted` —— 回合跑完也不再把回复推回手机；
+   *   2. 那一轮**还在跑**就顺手 `cancel`，别白烧 token。
+   * 取消与手机 `/stop` 共用 {@link CANCEL_QUIET_MS} 静默窗口，免得随后那条
+   * 没有嵌套原因的 `aborted` 又推一条「回合中断：unknown」。
+   *
+   * @param {string} serverId 消息来自哪个服务器
+   * @param {{sequence_id?: string, id?: string}} event ntfy 事件
+   */
+  handleDelete(serverId, event) {
+    const key = typeof event?.sequence_id === 'string' && event.sequence_id !== ''
+      ? event.sequence_id
+      : (typeof event?.id === 'string' ? event.id : '')
+    if (key === '') return
+
+    const inject = this.phoneInjects.get(key)
+    if (inject === undefined) {
+      // 常态而非错误：删掉的往往是插件自己推出去的通知——状态通知、死信开关的
+      // 撤销，服务器都会广播 message_delete。也可能是早就被 prune 掉的旧记录。
+      log(`inbound: 撤回 ${key}（server=${serverId}）没有对应的注入记录，忽略`)
+      return
+    }
+
+    inject.retracted = true
+    log(`inbound: 撤回 ${key}，取消对应的一轮 session=${inject.sessionId}`)
+
+    // 只有「那一轮正是当前在跑的这一轮」才中止；已经跑完的只标记，不做别的。
+    if (this.inflight.get(inject.sessionId) !== inject.messageId) return
+    this.phoneCancels.set(inject.sessionId, Date.now())
+    const agents = this.ctx.get('agents')
+    const agent = agents?.get?.(inject.sessionId)
+    if (typeof agent?.cancel === 'function') agent.cancel({ kind: 'user' })
+  }
+
+  /**
    * 处理一条 ntfy 入站消息。
    *
    * 顺序：过滤自己的消息 → 过滤重复 → 结构化回执（按钮）→ 自由文本回答待决请求
@@ -1171,6 +1754,13 @@ export class Bridge {
   async handleInbound(serverId, event) {
     const entry = this.topicIndex.get(event.topic)
     if (entry === undefined || entry.serverId !== serverId) return
+
+    // 撤回：用户在 App 里删掉了自己发的消息（ntfy 广播 message_delete，sequence_id
+    // 就是被删消息的 id）。它不是用户输入，走单独一条路。
+    if (event.event === 'message_delete') {
+      this.handleDelete(serverId, event)
+      return
+    }
     // 主防线：与时间无关的标记过滤（见 MARKER_TAG 注释）。
     if (Array.isArray(event.tags) && event.tags.includes(MARKER_TAG)) return
     // 第二道防线：正文与刚推送出去的通知完全一致。
@@ -1186,13 +1776,26 @@ export class Bridge {
     this.saver.schedule()
 
     const payload = parseNtfyMessage(event.message)
-    if (payload !== null && typeof payload === 'object') {
-      if (typeof payload.requestId === 'string' && this.settlePending(payload.requestId, payload)) return
+    if (isDecisionPayload(payload)) {
+      // 命中了待决请求就结算。
+      if (this.settlePending(payload.requestId, payload)) return
+      // 没命中 = **过期回执**：用户点了旧通知上残留的按钮（真机实测：请求早已提交，
+      // 再点一次旧按钮，那条 JSON 会被当成用户消息原样注入会话，模型收到一段乱码）。
+      // 必须丢弃，绝不能落到下面的文本分支。
+      log(`inbound: 忽略过期回执（无匹配的待决请求）requestId=${payload.requestId}`)
+      return
     }
 
     const text = typeof payload === 'string' ? payload : String(payload.answer ?? payload.text ?? event.message)
+
+    // ntfy 安卓端的空回复哨兵：既不是用户内容，也不该被当成对某个待决请求的作答。
+    if (isEmptyReplySentinel(text)) {
+      log(`inbound: 忽略空回复哨兵「${EMPTY_REPLY_SENTINEL}」session=${entry.sessionId}`)
+      return
+    }
+
     if (this.settlePendingByText(entry.sessionId, text)) return
-    await this.handleUserText(entry.sessionId, text, event.topic)
+    await this.handleUserText(entry.sessionId, text, event.id)
   }
 
   /**
@@ -1205,8 +1808,48 @@ export class Bridge {
   settlePending(requestId, payload) {
     const pending = this.pending.get(requestId)
     if (pending === undefined) return false
+
+    // 多选的「切换」：只改选中集合，**不结算**请求——用户可以点很多次。
+    if (typeof payload.toggle === 'string') {
+      const label = payload.toggle
+      if (pending.selected.has(label)) pending.selected.delete(label)
+      else pending.selected.add(label)
+      log(`relay: 多选切换「${label}」→ 当前选中 ${pending.selected.size} 项`)
+      this.acknowledgeSelection(pending)
+      return true
+    }
+
+    // 多选的「提交」：拿当前选中集合结算。
+    if (payload.submit === true) {
+      const selected = [...pending.selected]
+      log(`relay: 多选提交，共 ${selected.length} 项`)
+      pending.finish({ requestId, selected })
+      return true
+    }
+
     pending.finish(payload)
     return true
+  }
+
+  /**
+   * 回一条**静默**消息，告诉用户当前选中了哪些选项。
+   *
+   * 没有它多选就是盲点：ntfy 的按钮无法回显「已选中」状态，用户点完第二个就
+   * 记不清第一个还在不在。用 priority 1（min）发，不响铃不震动，只作为话题里的
+   * 一行回执。
+   *
+   * @param {{sessionId: string, selected: Set<string>}} pending 待决请求
+   */
+  acknowledgeSelection(pending) {
+    const selected = [...pending.selected]
+    const message = selected.length === 0
+      ? '已取消全部选择。'
+      : `已选 ${selected.length} 项：${selected.join('、')}`
+    void this.notify(pending.sessionId, {
+      title: `${this.labelFor(pending.sessionId)} · 已选`,
+      message,
+      priority: 1,
+    }).catch((error) => log(`relay: 选中状态回执失败 ${describeError(error)}`))
   }
 
   /**
@@ -1314,7 +1957,7 @@ export class Bridge {
         finish(null)
       }, timeoutMs)
 
-      this.pending.set(requestId, { sessionId, kind, finish })
+      this.pending.set(requestId, { sessionId, kind, finish, selected: new Set() })
 
       if (signal?.aborted === true) {
         finish(null)
@@ -1401,6 +2044,13 @@ export class Bridge {
 
         const answer = String(decision.answer ?? '').trim()
         if (multi) {
+          // 按钮路径：桥接侧累积的选中集合（见 settlePending 的 toggle / submit）。
+          if (Array.isArray(decision.selected)) {
+            answers.push({ id: question.id, selected: decision.selected })
+            continue
+          }
+          // 文本路径：回复编号或标签，逗号分隔（例如 1,3）。两条路都保留，
+          // 用户想手打就手打，想点就点。
           const selected = []
           for (const token of splitAnswerTokens(answer)) {
             const label = matchOption(token, options)
@@ -1432,7 +2082,7 @@ export class Bridge {
    * @param {string} sessionId 会话 id
    * @param {string} rawText 原始文本
    */
-  async handleUserText(sessionId, rawText) {
+  async handleUserText(sessionId, rawText, originId) {
     const text = String(rawText ?? '').trim()
     if (text === '') return
 
@@ -1462,7 +2112,7 @@ export class Bridge {
       }
       return
     }
-    await this.executeTurn(agent, text)
+    await this.executeTurn(agent, text, originId)
   }
 
   /**
@@ -1471,18 +2121,30 @@ export class Bridge {
    * @param {{id: string, session: any, followup: (message: object) => void, whenIdle: () => Promise<void>}} agent 目标 agent
    * @param {string} text 用户消息
    */
-  async executeTurn(agent, text) {
+  async executeTurn(agent, text, originId) {
     const session = agent.session
     const boundarySeq = typeof session?.seq === 'number' ? session.seq : 0
-    this.inflight.add(agent.id)
+    const messageId = randomUUID()
+    // 记下「ntfy 上那条消息 ↔ 注入出来的 DSH 消息」，撤回时靠它对上号。
+    if (typeof originId === 'string' && originId !== '') {
+      this.phoneInjects.set(originId, { sessionId: agent.id, messageId, retracted: false })
+      this.pruneInjects()
+    }
+    this.inflight.set(agent.id, messageId)
     try {
       agent.followup({
-        id: randomUUID(),
+        id: messageId,
         role: 'user',
         content: [{ type: 'text', text }],
         source: { kind: 'user' },
       })
       await agent.whenIdle()
+
+      // 这一条在排队/运行时被撤回了（用户在 App 里删掉了它）：什么都别推。
+      if (originId !== undefined && this.phoneInjects.get(originId)?.retracted === true) {
+        log(`inbound: 本轮已被撤回，跳过推送 session=${agent.id}`)
+        return
+      }
 
       let events = []
       try {
@@ -1560,7 +2222,13 @@ export class Bridge {
       // 记下这次取消是手机发起的：它产生的 aborted 没有嵌套原因，压掉那条「回合中断：unknown」。
       this.phoneCancels.set(sessionId, Date.now())
       agent.cancel({ kind: 'user' })
-      await this.notify(sessionId, { title: this.labelFor(sessionId), message: '已请求中止当前回合。' })
+      // 回合心跳已经在跟这一轮了：它收尾时会原地把状态通知变成「⏹ DSH 已中止 · N 秒」，
+      // 等于把"中止成功了"这件事说完了。再单独推一条「已请求中止当前回合。」只会让
+      // 话题里多出一行——真机上就是三条记录（你的 /stop + 状态 + 这条回执）。
+      // 只有心跳不在跑（例如对着空闲会话发 /stop）时才补这条确认。
+      if (!this.heartbeats.has(sessionId)) {
+        await this.notify(sessionId, { title: this.labelFor(sessionId), message: '已请求中止当前回合。' })
+      }
       return true
     }
     return false

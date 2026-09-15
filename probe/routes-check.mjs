@@ -10,6 +10,7 @@ import { Readable } from 'node:stream'
 import { Bridge, deepLink } from '../bridge.js'
 import { topicFor } from '../topics.js'
 import { qrSvg } from '../qr.js'
+import { PREF_KEYS } from '../config.js'
 import { PREFIX, registerRoutes } from '../routes.js'
 
 let failed = 0
@@ -108,7 +109,12 @@ const overrides = () => Object.keys(state.sessions[SESSION].prefs ?? {})
 console.log('状态与页面')
 const statusRes = await call('/status', undefined, 'GET')
 check('GET /status → 200 且 ok', statusRes.status === 200 && statusRes.json.ok === true)
-check('status 带 defaults 与 5 个 prefKeys', statusRes.json?.defaults?.relayTimeoutSec === 180 && statusRes.json.prefKeys.length === 5)
+// 不写死数量：以 config.js 的 PREF_KEYS 为唯一真源，以后再加偏好键不会误报。
+check('status 的 prefKeys 与 PREF_KEYS 完全一致',
+  statusRes.json?.defaults?.relayTimeoutSec === 180
+  && statusRes.json.prefKeys.length === PREF_KEYS.length
+  && PREF_KEYS.every((key) => statusRes.json.prefKeys.includes(key)),
+  `实际 ${JSON.stringify(statusRes.json?.prefKeys)}`)
 check('status 列出已绑定会话', statusRes.json.sessions.some((s) => s.id === SESSION && s.enabled === true))
 const pageRes = await call('', undefined, 'GET')
 check('GET / → 状态页 HTML', pageRes.status === 200 && pageRes.raw.includes('Ntfy Remote'))

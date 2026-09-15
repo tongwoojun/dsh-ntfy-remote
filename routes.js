@@ -18,7 +18,7 @@
 const VERSION = new URL(import.meta.url).search
 const { describeError, log } = await import(`./log.js${VERSION}`)
 const { PREF_KEYS, newServerId, normalizeServer, saveConfig } = await import(`./config.js${VERSION}`)
-const { deepLink } = await import(`./bridge.js${VERSION}`)
+const { deepLink, clampHeartbeatSec } = await import(`./bridge.js${VERSION}`)
 const { topicUrl } = await import(`./topics.js${VERSION}`)
 const { qrSvg } = await import(`./qr.js${VERSION}`)
 
@@ -302,10 +302,13 @@ export function registerRoutes(ctx, bridge) {
 
   post('/config', async (body) => {
     const config = bridge.config
-    for (const key of ['notifyOnTurnEnd', 'notifyOnPending', 'notifyOnError', 'phonePriority']) {
+    for (const key of ['notifyOnTurnEnd', 'notifyOnPending', 'notifyOnError', 'phonePriority', 'notifyOnWebTurn']) {
       if (typeof body[key] === 'boolean') config.defaults[key] = body[key]
     }
     if (Number.isFinite(body.relayTimeoutSec) && body.relayTimeoutSec >= 5) config.defaults.relayTimeoutSec = Math.floor(body.relayTimeoutSec)
+    // 心跳间隔：钳到允许范围（见 bridge.js 的 clampHeartbeatSec）。死信超时与卡住阈值
+    // 都由它推导，所以这里只存这一个值。
+    if (body.heartbeatSec !== undefined) config.defaults.heartbeatSec = clampHeartbeatSec(body.heartbeatSec)
     if (typeof body.defaultServerId === 'string' && config.servers.some((s) => s.id === body.defaultServerId)) {
       config.defaultServerId = body.defaultServerId
     }
@@ -368,6 +371,8 @@ function statusPage() {
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
 // 「作答超时」(relayTimeoutSec) 是什么：会话偏好与全局默认两处共用一句说明。
 const TIMEOUT_HINT = '作答超时：审批 / 提问推到手机后，最多等这么久你的回复；超时自动回落 DSH 原生交互，本地弹窗继续等，请求不会丢。出厂默认 180 秒。'
+// 心跳间隔说明。另外两个时间由它推导，写清楚免得用户到处找。
+const HEARTBEAT_HINT = '回合心跳间隔（秒）：回合进行中，每这么多秒原地更新一次手机上的状态通知（同一条，不刷屏）。死信超时与「疑似卡住」阈值由它推导：分别是 3 倍与 9 倍。范围 5~300，默认 20。'
 // 复制话题名：优先 async clipboard（localhost / https 是安全上下文），局域网明文 http
 // 不是安全上下文，退回隐藏 textarea + execCommand。
 async function copyText(text) {
@@ -486,6 +491,7 @@ async function render() {
       notifyOnPending: { label: '审批 / 提问推送', hint: '需要你审批或回答时推一条高优先级通知，并等手机作答。' },
       notifyOnError: { label: '错误 / 中断推送', hint: '模型报错、达到输出上限、被策略拦截时推精简原因；你自己在桌面点「停止」不推。' },
       phonePriority: { label: '手机优先接管作答', hint: '待决的审批 / 提问由手机来答（网页端不再显示该弹窗）；关掉后仍会推送，但作答回到网页端。' },
+      notifyOnWebTurn: { label: '网页发起的回合也推送', hint: '关掉后，只有在手机上发起的回合才会推送到手机——回复与状态心跳都不发。适合"人就在电脑前，别再来打扰我"的会话；代价是「在电脑上发起长任务、走开后手机收结果」也会一起没有。默认开。' },
     }
     for (const key of Object.keys(defs)) {
       const item = defs[key]
@@ -593,7 +599,10 @@ async function render() {
     '<label><input type="checkbox" id="d-pending" ' + (d.notifyOnPending ? 'checked' : '') + '> 审批/提问推送</label>' +
     '<label><input type="checkbox" id="d-error" ' + (d.notifyOnError ? 'checked' : '') + '> 错误/中断推送</label>' +
     '<label><input type="checkbox" id="d-phone" ' + (d.phonePriority ? 'checked' : '') + '> 手机优先接管作答</label></div>' +
-    '<div class="row">作答超时 <input id="d-timeout" type="number" min="5" value="' + d.relayTimeoutSec + '" style="width:90px" title="' + esc(TIMEOUT_HINT) + '"> 秒</div>' +
+    '<label><input type="checkbox" id="d-web" ' + (d.notifyOnWebTurn ? 'checked' : '') + '> 网页发起的回合也推送</label></div>' +
+    '<div class="row">作答超时 <input id="d-timeout" type="number" min="5" value="' + d.relayTimeoutSec + '" style="width:90px" title="' + esc(TIMEOUT_HINT) + '"> 秒' +
+    ' 心跳间隔 <input id="d-hb" type="number" min="5" max="300" value="' + d.heartbeatSec + '" style="width:90px" title="' + esc(HEARTBEAT_HINT) + '"> 秒</div>' +
+    '<div class="muted" style="font-size:11px;line-height:1.5">' + esc(HEARTBEAT_HINT) + '</div>' +
     '<div class="muted" style="font-size:11px;line-height:1.5">' + esc(TIMEOUT_HINT) + '</div>' +
     '<div class="row"><button id="d-save">保存默认</button></div>')
   document.getElementById('d-save').onclick = async () => {
@@ -603,7 +612,9 @@ async function render() {
         notifyOnPending: document.getElementById('d-pending').checked,
         notifyOnError: document.getElementById('d-error').checked,
         phonePriority: document.getElementById('d-phone').checked,
+        notifyOnWebTurn: document.getElementById('d-web').checked,
         relayTimeoutSec: Number(document.getElementById('d-timeout').value),
+        heartbeatSec: Number(document.getElementById('d-hb').value),
       })
       note('默认已保存', 'ok'); render()
     } catch (e) { note(e.message, 'err') }

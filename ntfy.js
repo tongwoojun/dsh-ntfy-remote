@@ -94,6 +94,12 @@ export async function publish(server, payload) {
   // ntfy 默认按纯文本渲染；置 true 让客户端（安卓用 Markwon）把 markdown 渲染出来。
   // 服务端会在发布响应里回显 content_type: text/markdown 作为确认。
   if (payload.markdown !== undefined) body.markdown = payload.markdown
+  // 同一个 sequence_id 再次发布，客户端会**替换**上一条通知（真机实测：通知栏与
+  // 话题对话都收敛成一条）。必须走 JSON 字段——塞进 URL 路径的话 ntfy 不解析 JSON，
+  // 整段 body 会被当成正文（实测踩过）。
+  if (payload.sequenceId !== undefined) body.sequence_id = payload.sequenceId
+  // 定时投递（死信开关）：到点才发；用同一个 sequence_id 再发 = 把投递时间往后推。
+  if (payload.delay !== undefined) body.delay = payload.delay
 
   try {
     const response = await fetch(url, {
@@ -110,6 +116,34 @@ export async function publish(server, payload) {
     return { ok: true, id: data?.id ?? null, status: response.status }
   } catch (error) {
     log(`ntfy: 发布异常 ${describeError(error)}`)
+    return { ok: false, error: describeError(error) }
+  }
+}
+
+/**
+ * 按 sequence id 删除一条通知。
+ *
+ * ntfy 的 `DELETE /<topic>/<sequence_id>` 会向订阅者发一条 `message_delete` 事件，
+ * 客户端据此把那条通知从**通知栏和本地库**里移除（真机实测：6 条一次清掉）。
+ * 也用来**取消尚未投递的定时消息**——死信开关正常收尾时就靠它，否则告警会在
+ * 回合结束后突然响起来。
+ *
+ * @param {{url: string, token?: string}} server 服务器描述符
+ * @param {string} topic 话题
+ * @param {string} sequenceId 序列 id
+ * @returns {Promise<{ok: boolean, status?: number, error?: string}>}
+ */
+export async function removeMessage(server, topic, sequenceId) {
+  const url = `${normalizeServer(server?.url)}/${topic}/${sequenceId}`
+  try {
+    const response = await fetch(url, { method: 'DELETE', headers: headersFor(server, false) })
+    if (!response.ok) {
+      log(`ntfy: 删除通知失败 HTTP ${response.status}（topic=${topic} seq=${sequenceId}）`)
+      return { ok: false, status: response.status }
+    }
+    return { ok: true, status: response.status }
+  } catch (error) {
+    log(`ntfy: 删除通知异常 ${describeError(error)}`)
     return { ok: false, error: describeError(error) }
   }
 }
@@ -189,6 +223,13 @@ export function createSubscriber({ getServer, getTopics, getSince, onEvent, onSt
           continue
         }
         // open / keepalive 等事件没有 message 字段，跳过。
+        // 放行两种事件：message（普通消息）与 message_delete（撤回）。
+        // 后者是「用户在 App 里删掉了自己发的消息」的**唯一**信号——ntfy 把它广播给
+        // 所有订阅者，`sequence_id` 就是被删消息的 id。划掉通知栏不算，那纯属本地行为。
+        if (event.event === 'message_delete') {
+          onEvent(event)
+          continue
+        }
         if (event.event !== 'message' || typeof event.message !== 'string') continue
         onEvent(event)
       }
