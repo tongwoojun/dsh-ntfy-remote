@@ -31,6 +31,12 @@ async function publish(server, payload) {
 }
 
 const url = (process.argv[2] ?? 'https://ntfy.sh').replace(/\/+$/, '')
+/**
+ * 可选的访问 token（第三个参数）：自建服务器常开鉴权，发布、订阅、以及**动作按钮
+ * 回传**都要带。用自建服务器跑可以躲开 ntfy.sh 免费的按 visitor 限流（429），
+ * 反复跑不会被卡住。
+ */
+const token = process.argv[3] ?? ''
 const SESSION = 'session-aaaaaaaa-1111-2222-3333-444444444444'
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -58,8 +64,8 @@ const ctx = {
   },
 }
 
-const SERVER_A = { id: 'srv_a', name: '服务器A', url, token: '' }
-const SERVER_B = { id: 'srv_b', name: '服务器B', url, token: '' }
+const SERVER_A = { id: 'srv_a', name: '服务器A', url, token }
+const SERVER_B = { id: 'srv_b', name: '服务器B', url, token }
 
 const config = {
   servers: [SERVER_A, SERVER_B],
@@ -68,7 +74,7 @@ const config = {
     notifyOnTurnEnd: true,
     notifyOnPending: true,
     notifyOnError: true,
-    maxMessageLength: 3500,
+    maxMessageLength: 4000,
     relayTimeoutSec: 30,
     phonePriority: true,
   },
@@ -80,7 +86,7 @@ const enabled = bridge.enable(SESSION, { cwd: '/tmp/dsh-ntfy-remote-it' })
 const info = enabled.info
 bridge.saver = { schedule: () => {}, flush: () => {} }
 
-console.log(`server = ${url}`)
+console.log(`server = ${url}${token === '' ? '' : '（带 token）'}`)
 console.log(`out    = ${info.topic}`)
 console.log(`resp   = ${info.topic}`)
 
@@ -88,7 +94,7 @@ console.log(`resp   = ${info.topic}`)
 /** @type {object[]} */
 const seen = []
 const observer = createSubscriber({
-  getServer: () => ({ url, token: '', name: '观察者' }),
+  getServer: () => ({ url, token, name: '观察者' }),
   getTopics: () => [info.topic],
   getSince: () => 0,
   onEvent: (event) => seen.push(event),
@@ -231,6 +237,108 @@ await publish(SERVER_A, { topic: info.topic, message: '1,3' })
 const multiResult = await multiPromise
 check('多个编号映射为多个标签', JSON.stringify(multiResult?.value?.answers?.[0]?.selected) === JSON.stringify(['甲项', '丙项']), `实际 ${JSON.stringify(multiResult?.value)}`)
 check('多选未回落原生链', multiFellBack === false)
+seen.length = 0
+
+console.log('\nT8c 提问内容完整性：描述 / header / 计划正文都要真发出去')
+// 旧的实现只发 question + label，option.description、header、detail 全丢，而且
+// 超过 3 个选项就退化成「回复编号」。这里逐项钉住「桌面端看得到的，手机上也看得到」。
+seen.length = 0
+const richOptions = [
+  { label: '方案甲', description: '会删除数据，不可恢复。' },
+  { label: '方案乙', description: '只做备份，不动原数据。' },
+  { label: '方案丙', description: '什么都不做。' },
+  { label: '方案丁', description: '第四个选项，用来验证跨组编号。' },
+]
+const richPromise = bridge.handleAskUserQuestion(
+  {
+    name: 'ask_user_question',
+    agent: { id: SESSION },
+    arguments: {
+      questions: [{
+        id: 'q4',
+        header: '选择模式',
+        question: '要执行哪个方案？',
+        detail: '## 计划\n\n1. 备份\n2. 执行',
+        options: richOptions,
+      }],
+    },
+  },
+  async () => ({ isError: false, value: null, content: [] }),
+)
+await waitFor((e) => typeof e.message === 'string' && e.message.includes('方案丁'), 12_000, 'T8c 第二组选项')
+await delay(800)
+const batch = seen.filter((e) => Array.isArray(e.tags) && e.tags.includes('dsh-ntfy-remote'))
+const batchText = batch.map((e) => e.message).join('\n')
+
+check('4 个选项拆成了多条', batch.length >= 3, `实际 ${batch.length} 条`)
+check('每个选项的 description 都发出去了',
+  richOptions.every((o) => batchText.includes(o.description)),
+  `实际正文：${batchText.slice(0, 300)}`)
+check('header 发出去了', batchText.includes('**选择模式**'))
+check('计划正文（detail）发出去了', batchText.includes('## 计划'))
+check('标注了题型与第几问', batchText.includes('单选'))
+check('每个选项都有编号', richOptions.every((o, i) => batchText.includes(`${i + 1}. ${o.label}`)))
+check('正文声明为 markdown（content_type）',
+  batch.length > 0 && batch.every((e) => e.content_type === 'text/markdown'),
+  `实际 ${JSON.stringify(batch.map((e) => e.content_type))}`)
+check('只有第一条响铃（priority 4）', batch.filter((e) => e.priority === 4).length === 1,
+  `实际 ${JSON.stringify(batch.map((e) => e.priority))}`)
+check('后续条一律静音（priority 1）', batch.slice(1).every((e) => e.priority === 1),
+  `实际 ${JSON.stringify(batch.map((e) => e.priority))}`)
+check('多条时标题带 (k/n)',
+  batch.length > 1 && batch.every((e, i) => typeof e.title === 'string' && e.title.includes(`(${i + 1}/${batch.length})`)),
+  `实际 ${JSON.stringify(batch.map((e) => e.title))}`)
+
+// 单选即使带按钮，直接回编号也必须还原成标签（旧实现此处会落成 custom）。
+await publish(SERVER_A, { topic: info.topic, message: '4' })
+const richResult = await richPromise
+check('回编号也能命中跨组选项',
+  richResult?.value?.answers?.[0]?.selected?.[0] === '方案丁',
+  `实际 ${JSON.stringify(richResult?.value)}`)
+seen.length = 0
+
+console.log('\nT8d 多选提问：选项描述与跨组编号都不能丢（用户报的不全 bug）')
+// 多选走的是「不给按钮」那条分支，和单选分组的代码路径不同，描述最容易在这里被漏掉。
+// 内容里带 T8D 标记：上一组用例（T8c）的消息可能延迟到达，而它们是**带按钮**的单选，
+// 混进来会把「多选不带按钮」直接判失败。按标记过滤，跨用例互不污染。
+seen.length = 0
+const multiRichOptions = [
+  { label: 'T8D-甲项', description: 'T8D 甲项的取舍说明。' },
+  { label: 'T8D-乙项', description: 'T8D 乙项的取舍说明。' },
+  { label: 'T8D-丙项', description: 'T8D 丙项的取舍说明。' },
+  { label: 'T8D-丁项', description: 'T8D 丁项的取舍说明。' },
+]
+let multiRichFellBack = false
+const multiRichPromise = bridge.handleAskUserQuestion(
+  {
+    name: 'ask_user_question',
+    agent: { id: SESSION },
+    arguments: {
+      questions: [{ id: 'q5', header: '多选项', question: '要开哪几项？T8D', multi_select: true, options: multiRichOptions }],
+    },
+  },
+  async () => { multiRichFellBack = true; return { isError: false, value: null, content: [] } },
+)
+await waitFor((e) => typeof e.message === 'string' && e.message.includes('T8D-丁项'), 12_000, 'T8d 第二组选项')
+await delay(800)
+const multiBatch = seen.filter((e) => Array.isArray(e.tags) && e.tags.includes('dsh-ntfy-remote')
+  && typeof e.message === 'string' && e.message.includes('T8D'))
+const multiBatchText = multiBatch.map((e) => e.message).join('\n')
+check('多选 4 个选项拆成了多条', multiBatch.length >= 3, `实际 ${multiBatch.length} 条`)
+check('多选时不带按钮', multiBatch.every((e) => (e.actions ?? []).length === 0))
+check('多选每个选项的 label 都发出去了',
+  multiRichOptions.every((o) => multiBatchText.includes(o.label)))
+check('多选每条 description 都发出去了（这就是报的 bug）',
+  multiRichOptions.every((o) => multiBatchText.includes(o.description)),
+  `实际正文：${multiBatchText.slice(0, 300)}`)
+check('多选正文声明为 markdown', multiBatch.every((e) => e.content_type === 'text/markdown'))
+check('多选编号跨组连续', multiBatchText.includes('4. T8D-丁项'))
+await publish(SERVER_A, { topic: info.topic, message: '1, 4' })
+const multiRichResult = await multiRichPromise
+check('多选编号跨组映射为两个标签',
+  JSON.stringify(multiRichResult?.value?.answers?.[0]?.selected) === JSON.stringify(['T8D-甲项', 'T8D-丁项']),
+  `实际 ${JSON.stringify(multiRichResult?.value)}`)
+check('多选未回落原生链', multiRichFellBack === false)
 seen.length = 0
 
 console.log('\nT9 提问超时回落原生链')

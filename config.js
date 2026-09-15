@@ -36,7 +36,14 @@ export const DEFAULT_PREFS = {
   notifyOnTurnEnd: true,
   notifyOnPending: true,
   notifyOnError: true,
-  maxMessageLength: 3500,
+  /**
+   * 单条推送正文的字节预算（**字节**，不是字符）。
+   *
+   * 超出的部分会继续分片发出去，不会被丢掉——ntfy 的 message 字段上限是
+   * 4095 字节，超了整条拒收（HTTP 500），所以这个值同时也是分片阈值。
+   * 默认 4000：留几十字节余量，分片遇到代码围栏时还要补 "```" 并重开。
+   */
+  maxMessageLength: 4000,
   relayTimeoutSec: 180,
   phonePriority: true,
 }

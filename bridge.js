@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto'
 const VERSION = new URL(import.meta.url).search
 const { createStateSaver, findServer, rememberId } = await import(`./config.js${VERSION}`)
 const { describeError, log } = await import(`./log.js${VERSION}`)
-const { MAX_CATCHUP_SEC, createSubscriber, normalizeServer, publish } = await import(`./ntfy.js${VERSION}`)
+const { MAX_CATCHUP_SEC, NTFY_MESSAGE_MAX_BYTES, createSubscriber, normalizeServer, publish } = await import(`./ntfy.js${VERSION}`)
 const { parseNtfyMessage, shortSessionId, topicFor, topicUrl } = await import(`./topics.js${VERSION}`)
 
 /** 核对「已开启桥接的会话是否还存在」的周期。 */
@@ -38,6 +38,35 @@ const ASSISTANT_CACHE_LIMIT = 200
 
 /** ntfy 单条通知最多允许的按钮数；超过会直接 HTTP 400。 */
 const MAX_ACTION_BUTTONS = 3
+
+/**
+ * 单条正文的默认字节预算。
+ *
+ * ntfy 的硬上限是 4095 字节（4096 会被 HTTP 500 拒收，见 ntfy.js 的
+ * NTFY_MESSAGE_MAX_BYTES）。这里留约 95 字节余量：切点落在代码围栏内时还要
+ * 补一个 "```" 并重开围栏，贴着悬崖走容易翻车。
+ */
+const DEFAULT_CHUNK_BYTES = 4000
+
+/** 分片预算的绝对下限；配置被填成 1 之类时不至于切出成千上万条。 */
+const MIN_CHUNK_BYTES = 256
+
+/**
+ * 围栏修复给单片追加的最大字节数。
+ *
+ * 切点落在代码块内时，上一片要补 "\n```"（4 字节），下一片要重开 "```lang\n"
+ * （最多 7 字节）。所以真正的可用预算必须比 ntfy 硬上限低这么多——否则用户把
+ * 上限设成 4095 时，补完围栏的那一片又会越过 4096 被拒收。
+ */
+const FENCE_REPAIR_BYTES = 16
+
+/**
+ * 每个会话记住的「自己刚推出去的正文」条数，用于回声兜底。
+ *
+ * 必须大于一次推送的最大分片数：只记第一条的话，其余分片被服务器原样推回来时
+ * 认不出是自己发的。主防线仍是 MARKER_TAG，这里只是第二道。
+ */
+const OWN_TEXT_MEMORY = 12
 
 /**
  * 手机 `/stop` 之后的静默窗口：这段时间内该会话的中断推送一律压掉。
@@ -166,6 +195,253 @@ function matchOption(token, options) {
 export function deepLink(serverUrl, topic) {
   const host = normalizeServer(serverUrl).replace(/^https?:\/\//, '')
   return `ntfy://${host}/${topic}`
+}
+
+/**
+ * 一段正文按 UTF-8 编码的字节数。
+ *
+ * 分片一律以字节为准，不以字符为准：ntfy 的 message 上限是 4095 **字节**，
+ * 而一个汉字 3 字节、一个 emoji 最多 4 字节，按字符切会严重超发。
+ *
+ * @param {string} text 正文
+ * @returns {number}
+ */
+function byteLength(text) {
+  return Buffer.byteLength(String(text ?? ''), 'utf-8')
+}
+
+/**
+ * 返回「前 limitBytes 字节」对应的字符下标，保证切点落在字符边界上。
+ *
+ * 不能用 `slice(0, n)` 代替：n 是字节数，按字符下标切会把多字节字符劈成
+ * 半个，拼出乱码，甚至让 ntfy 拒收。
+ *
+ * @param {string} text 原文
+ * @param {number} limitBytes 字节预算
+ * @returns {number} 安全的字符下标（至少 1，避免死循环）
+ */
+function cutIndexAtBytes(text, limitBytes) {
+  let bytes = 0
+  let index = 0
+  for (const char of text) {
+    const size = Buffer.byteLength(char, 'utf-8')
+    if (bytes + size > limitBytes) break
+    bytes += size
+    index += char.length
+  }
+  return index === 0 ? 1 : index
+}
+
+/**
+ * 按字节预算粗切正文：优先切在行边界，单行超预算才硬切。
+ *
+ * @param {string} text 原文
+ * @param {number} budget 单条字节预算
+ * @returns {string[]}
+ */
+function rawChunks(text, budget) {
+  const out = []
+  let lines = []
+  let used = 0
+
+  const flush = () => {
+    if (lines.length === 0) return
+    const piece = lines.join('\n')
+    lines = []
+    used = 0
+    // 只装着空行的片没有意义（正文以换行开头时会出现），丢掉免得白发一条空消息。
+    if (piece !== '') out.push(piece)
+  }
+
+  for (const line of text.split('\n')) {
+    const cost = (lines.length === 0 ? 0 : 1) + byteLength(line)
+    if (used + cost <= budget) {
+      lines.push(line)
+      used += cost
+      continue
+    }
+    flush()
+    if (byteLength(line) <= budget) {
+      lines.push(line)
+      used = byteLength(line)
+      continue
+    }
+    // 单行本身就超预算（长段落、压缩过的 JSON、超长代码行）：按字节硬切。
+    let rest = line
+    while (byteLength(rest) > budget) {
+      const cut = cutIndexAtBytes(rest, budget)
+      out.push(rest.slice(0, cut))
+      rest = rest.slice(cut)
+    }
+    if (rest !== '') {
+      lines.push(rest)
+      used = byteLength(rest)
+    }
+  }
+  flush()
+  return out.length === 0 ? [''] : out
+}
+
+/** markdown 代码围栏（``` 或 ~~~），允许最多 3 个前导空格。 */
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/
+
+/**
+ * 读过一段文本后，围栏的新状态。
+ *
+ * @param {string | null} open 进入时的围栏开标记（如 ```js）；null 表示不在围栏内
+ * @param {string} text 文本
+ * @returns {string | null} 读完后的围栏状态
+ */
+function advanceFence(open, text) {
+  let state = open
+  for (const line of text.split('\n')) {
+    if (FENCE_RE.exec(line) === null) continue
+    state = state === null ? line.trim() : null
+  }
+  return state
+}
+
+/**
+ * 把 markdown 正文按字节预算切成多条待发消息。
+ *
+ * 存在的理由：ntfy 的 message 字段有 4095 字节硬上限，超了整条会被服务端拒收，
+ * 而拒收是静默的（publish 只返回 ok:false，调用方多半是 void）。旧实现按
+ * **字符**截断到 3500，中文折算 10500 字节，长回复整条丢失——这里改成按字节分片，
+ * 内容不丢，只是多几条。
+ *
+ * 切完还要修围栏：切点落在 ``` 代码块内部时，md 渲染会从切点开始烂掉（后面
+ * 全进了代码块）。所以给上一片补一个闭合围栏、给下一片重新打开围栏。预算留了
+ * 余量，补这几字节不会顶到 ntfy 硬上限。
+ *
+ * @param {string} text 原文（markdown）
+ * @param {number} [limitBytes] 单条字节预算；缺省用 DEFAULT_CHUNK_BYTES
+ * @returns {string[]} 分片结果，至少一条；未超预算时原样返回单条
+ */
+export function splitForNtfy(text, limitBytes = DEFAULT_CHUNK_BYTES) {
+  const value = String(text ?? '')
+  if (value === '') return ['']
+
+  const raw = Number(limitBytes)
+  const budget = Math.max(
+    MIN_CHUNK_BYTES,
+    Math.min(
+      Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CHUNK_BYTES,
+      NTFY_MESSAGE_MAX_BYTES - FENCE_REPAIR_BYTES,
+    ),
+  )
+  if (byteLength(value) <= budget) return [value]
+
+  const pieces = rawChunks(value, budget)
+
+  // 先按**原始**分片推进围栏状态。必须用未修改的 pieces：第一处补上的闭合
+  // 围栏会改变后续所有边界的判定，就地边改边算会一路错下去。
+  const fenceAfter = []
+  let open = null
+  for (const piece of pieces) {
+    open = advanceFence(open, piece)
+    fenceAfter.push(open)
+  }
+
+  for (let i = 0; i < pieces.length - 1; i++) {
+    const fence = fenceAfter[i]
+    if (fence === null) continue
+    pieces[i] = `${pieces[i]}\n\`\`\``
+    pieces[i + 1] = `${fence}\n${pieces[i + 1]}`
+  }
+  return pieces
+}
+
+/**
+ * 构造 ntfy 动作按钮。
+ *
+ * 服务器启用鉴权时，按钮必须自带 Authorization 头：ntfy 的动作按钮是**手机直接**
+ * 向服务器发 POST，不走插件的 HTTP 客户端，所以 token 得写进动作定义里。少了它，
+ * 在自建（开了 auth）的服务器上点按钮一律 HTTP 403——实测踩过：作者自己的阿里云
+ * 服务器 tokenSet=true，两个按钮点下去都是 403，只能退回手打编号。
+ *
+ * @param {{url: string, token?: string}} server 服务器描述符
+ * @param {string} topic 话题
+ * @param {string} requestId 待决请求 id
+ * @param {{label: string, value: object}[]} buttons 按钮定义
+ * @returns {object[]} ntfy actions 数组
+ */
+export function buildActionButtons(server, topic, requestId, buttons) {
+  const headers = typeof server?.token === 'string' && server.token !== ''
+    ? { Authorization: `Bearer ${server.token}` }
+    : undefined
+  return buttons.map((button) => ({
+    action: 'http',
+    label: button.label,
+    url: `${normalizeServer(server.url)}/${topic}`,
+    method: 'POST',
+    clear: false,
+    headers,
+    body: JSON.stringify({ requestId, ...button.value }),
+  }))
+}
+
+/**
+ * 把一道提问组装成待发消息列表。
+ *
+ * 一条通知装不下的内容一律分条，不截断。选项按 ntfy 动作按钮的上限（3 个）
+ * 分组，每组一条消息、各带各组自己的按钮；所有按钮共用同一个 requestId，
+ * 因此点哪一条上的按钮都能结算同一个待决请求。
+ *
+ * 内容取舍对齐桌面端（dsh-client-ui-user-questions 的渲染）：header、question、
+ * detail、以及每个选项的 label **和 description** 都要带上。description 尤其不能
+ * 省——标签常常只是「方案 A」这类短语，真正的取舍写在描述里，缺了等于让人闭眼选。
+ * detail 是计划模式下的被审阅正文（dsh-plan-mode 把整份 plan 塞在这里），
+ * 缺了就成了「拿空白批准计划」。
+ *
+ * @param {{question?: string, header?: string, detail?: string, multi_select?: boolean}} question 提问
+ * @param {{label?: string, description?: string}[]} options 选项
+ * @param {{index: number, total: number}} position 第几问 / 共几问（均 0 起 / 总数）
+ * @returns {{message: string, buttons?: {label: string, value: object}[]}[]}
+ */
+export function buildQuestionParts(question, options, position) {
+  const multi = question.multi_select === true
+  const head = []
+
+  const header = typeof question.header === 'string' ? question.header.trim() : ''
+  if (header !== '') head.push(`**${header}**`)
+  head.push(String(question.question ?? '提问'))
+
+  const labels = [multi ? '多选' : '单选']
+  if (position.total > 1) labels.unshift(`第 ${position.index + 1}/${position.total} 问`)
+  head.push(`（${labels.join(' · ')}）`)
+
+  // detail 可能很长（整份计划），单独成段后交给分片器按字节切。
+  const detail = typeof question.detail === 'string' ? question.detail.trim() : ''
+  if (detail !== '') head.push('', detail)
+
+  const parts = [{ message: head.join('\n') }]
+
+  // 编号跨组连续；matchOption 按整份 options 的数字下标还原，所以分组不影响作答。
+  for (let start = 0; start < options.length; start += MAX_ACTION_BUTTONS) {
+    const items = options.slice(start, start + MAX_ACTION_BUTTONS)
+    const lines = items.map((option, offset) => {
+      const text = `${start + offset + 1}. ${String(option?.label ?? '')}`
+      const description = typeof option?.description === 'string' ? option.description.trim() : ''
+      // 缩进 3 格：md 里算上一项的续行，渲染出来就贴在标签下面。
+      return description === '' ? text : `${text}\n   ${description}`
+    })
+    const last = start + MAX_ACTION_BUTTONS >= options.length
+    if (last) {
+      lines.push('', multi
+        ? '多选：回复编号或标签，逗号分隔（例如 1,3）；也可以直接打字。'
+        : '点按钮，或回复编号 / 标签；也可以直接打字。')
+    }
+    parts.push({
+      message: lines.join('\n'),
+      // 多选不能用按钮：按钮是无状态的单次回执，点第二个只会多出一条回执，
+      // 表达不了「选中的集合」。所以多选一律走编号 / 标签文本作答。
+      buttons: multi
+        ? undefined
+        : items.map((option) => ({ label: String(option?.label ?? ''), value: { answer: option?.label } })),
+    })
+  }
+
+  return parts
 }
 
 /** 会话 ↔ ntfy 话题桥接。 */
@@ -634,15 +910,77 @@ export class Bridge {
   }
 
   /**
-   * 按长度上限截断正文。
+   * 单条正文的字节预算。
    *
-   * @param {string} text 原文
-   * @returns {string}
+   * 配置项 `maxMessageLength` 的单位是**字节**（不是字符），并且上限硬钳到
+   * ntfy 的 4095：它是「一条消息装多少」，不是「总共发多少」——超出的部分会
+   * 继续分片发出去，不会再被截断丢掉。
+   *
+   * @returns {number}
    */
-  truncate(text) {
-    const max = Number(this.config.defaults.maxMessageLength) || 3500
-    const value = String(text ?? '')
-    return value.length <= max ? value : `${value.slice(0, max)}\n…（已截断 ${value.length - max} 字）`
+  chunkBytes() {
+    const raw = Number(this.config.defaults.maxMessageLength)
+    const value = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_CHUNK_BYTES
+    return Math.max(MIN_CHUNK_BYTES, Math.min(value, NTFY_MESSAGE_MAX_BYTES))
+  }
+
+  /**
+   * 按顺序发一批已切好的消息。
+   *
+   * 「只有第一条响铃」是刻意的：一次提问拆成 4 条时，让手机震 4 次比少几条更烦。
+   * 后续片一律 priority 1（min，静音），标题带 (k/n) 让用户知道还有后续。
+   * 标题后缀只在多于一条时加，单条的老行为完全不变。
+   *
+   * 某一条失败**不中断整批**：已经送达的按钮仍然能结算同一个 requestId，半批
+   * 内容也比什么都没有强。只要有一条成功就认为这批可用。失败逐条写日志——
+   * 旧实现正是「失败只写日志、调用方又是 void」，才让长中文通知静默消失。
+   *
+   * @param {string} sessionId 会话 id
+   * @param {{url: string, token?: string}} server 服务器描述符
+   * @param {{message: string, actions?: object[]}[]} messages 待发消息（已分片）
+   * @param {{title?: string, topic?: string, priority?: number, tags?: string[], click?: string}} base 公共字段
+   * @returns {Promise<{ok: boolean, sent: number, id: string | null, error?: string}>}
+   */
+  async sendMessages(sessionId, server, messages, base) {
+    const total = messages.length
+    let sent = 0
+    let firstId = null
+    let error
+
+    for (let i = 0; i < total; i++) {
+      const item = messages[i]
+      let actions = item.actions
+      if (Array.isArray(actions) && actions.length > MAX_ACTION_BUTTONS) {
+        log(`outbound: 按钮 ${actions.length} 个超过 ntfy 上限 ${MAX_ACTION_BUTTONS}，已省略`)
+        actions = undefined
+      }
+      const result = await publish(server, {
+        topic: base.topic,
+        title: total > 1 && base.title !== undefined ? `${base.title} (${i + 1}/${total})` : base.title,
+        message: item.message,
+        // 第一条用调用方给的优先级（可能是 undefined，即默认正常优先级），
+        // 其余一律降到 1（min，静音）。
+        priority: i === 0 ? base.priority : 1,
+        tags: base.tags,
+        actions,
+        click: base.click,
+        markdown: true,
+      })
+      if (result.ok) {
+        sent += 1
+        if (firstId === null) firstId = result.id ?? null
+        this.rememberOwn(result.id)
+        // 每一片都要记：回声兜底按正文比对，只记第一片会让其余片被当成用户输入。
+        this.rememberOwnText(sessionId, item.message)
+      } else {
+        error = result.error ?? `HTTP ${result.status}`
+        log(`outbound: 第 ${i + 1}/${total} 条推送失败 ${error}`)
+      }
+    }
+
+    return sent > 0
+      ? { ok: true, sent, id: firstId }
+      : { ok: false, sent: 0, id: null, error: error ?? 'publish-failed' }
   }
 
   /**
@@ -678,9 +1016,12 @@ export class Bridge {
   /**
    * 发布一条通知到该会话绑定的服务器。
    *
+   * 正文超过单条字节预算时自动分片发多条，**不再截断**——ntfy 的超长消息是
+   * 整条拒收而不是截断，旧实现的「按字符截断」会让长中文回复静默丢失。
+   *
    * @param {string} sessionId 会话 id
    * @param {{title?: string, message: string, priority?: number, tags?: string[], actions?: object[], topic?: string, click?: string}} options 通知内容
-   * @returns {Promise<{ok: boolean, id?: string | null, error?: string}>}
+   * @returns {Promise<{ok: boolean, sent?: number, id?: string | null, error?: string}>}
    */
   async notify(sessionId, options) {
     if (!this.isCurrent()) return { ok: false, error: 'stale' }
@@ -690,28 +1031,28 @@ export class Bridge {
       log(`outbound: 会话 ${sessionId} 没有可用的服务器绑定，跳过推送`)
       return { ok: false, error: 'server-missing' }
     }
-    const topic = options.topic ?? binding.topic
-    const result = await publish(server, {
-      topic,
+    const chunks = splitForNtfy(options.message, this.chunkBytes())
+    const messages = chunks.map((message, index) => ({
+      message,
+      // 动作按钮只挂在第一条上：按钮是「对这条通知的动作」，跟着续片没有意义。
+      actions: index === 0 ? options.actions : undefined,
+    }))
+    return await this.sendMessages(sessionId, server, messages, {
+      topic: options.topic ?? binding.topic,
       title: options.title,
-      message: this.truncate(options.message),
       priority: options.priority,
       tags: [...new Set([...(options.tags ?? []), MARKER_TAG])],
-      actions: options.actions,
       // 不设 click：通知本来就在会话话题里，点开就是该话题，直接打字即可。
       // 附带好处是摆脱了 ntfy:// 深链接的「Android 专有」限制。
       click: options.click,
     })
-    if (result.ok) {
-      this.rememberOwn(result.id)
-      // 回环兜底：记住刚推送出去的正文（见 isOwnEcho）。
-      this.rememberOwnText(sessionId, this.truncate(options.message))
-    }
-    return result
   }
 
   /**
    * 记住刚推送出去的正文，作为「自己回自己」的第二道兜底。
+   *
+   * 一次推送可能分很多片（见 sendMessages），所以名单长度必须盖得住分片数，
+   * 否则后面几片穿过去会被当成用户输入。
    *
    * @param {string} sessionId 会话 id
    * @param {string} text 已推送的正文
@@ -719,7 +1060,7 @@ export class Bridge {
   rememberOwnText(sessionId, text) {
     const list = this.recentOwn.get(sessionId) ?? []
     list.push(text)
-    if (list.length > 3) list.splice(0, list.length - 3)
+    if (list.length > OWN_TEXT_MEMORY) list.splice(0, list.length - OWN_TEXT_MEMORY)
     this.recentOwn.set(sessionId, list)
   }
 
@@ -866,12 +1207,12 @@ export class Bridge {
   }
 
   /**
-   * 发一条需要手机作答的通知，并等待回执。
+   * 发一条或多条需要手机作答的通知，并等待回执。
    *
    * 超时、推送失败或请求被取消都返回 null，由调用方回落 DSH 原生交互。
    *
    * @param {string} sessionId 会话 id
-   * @param {{title: string, message: string, kind: string, buttons?: {label: string, value: object}[], hint?: string, signal?: AbortSignal}} options 请求内容
+   * @param {{title: string, kind: string, parts: {message: string, buttons?: {label: string, value: object}[]}[], signal?: AbortSignal}} options 请求内容
    * @returns {Promise<object | null>} 回执内容，或 null 表示回落
    */
   async requestDecision(sessionId, options) {
@@ -880,27 +1221,26 @@ export class Bridge {
     const server = this.serverFor(sessionId)
     if (server === null || binding === undefined) return null
 
-    const buttons = options.buttons ?? []
-    const usable = buttons.length > 0 && buttons.length <= MAX_ACTION_BUTTONS
-    const actions = usable
-      ? buttons.map((button) => ({
-          action: 'http',
-          label: button.label,
-          url: `${normalizeServer(server.url)}/${binding.topic}`,
-          method: 'POST',
-          clear: false,
-          body: JSON.stringify({ requestId, ...button.value }),
-        }))
-      : undefined
+    // 把 parts 展开成待发消息：每条正文各自按字节分片；按钮只挂在该 part 的
+    // 最后一片上（切出来的续片是纯正文，没有可点的东西）。
+    const messages = []
+    for (const part of options.parts) {
+      const chunks = splitForNtfy(part.message, this.chunkBytes())
+      const buttons = Array.isArray(part.buttons) ? part.buttons : []
+      const usable = buttons.length > 0 && buttons.length <= MAX_ACTION_BUTTONS
+      const actions = usable ? buildActionButtons(server, binding.topic, requestId, buttons) : undefined
+      chunks.forEach((message, index) => {
+        const isLast = index === chunks.length - 1
+        messages.push({ message, actions: isLast ? actions : undefined })
+      })
+    }
+    if (messages.length === 0) return null
 
-    const hint = options.hint ?? (usable ? '\n\n点按钮，或直接在本话题回复。' : '\n\n选项较多，请回复编号，或直接在本话题回复文字。')
-
-    const sent = await this.notify(sessionId, {
+    const sent = await this.sendMessages(sessionId, server, messages, {
+      topic: binding.topic,
       title: options.title,
-      message: `${options.message}${hint}`,
       priority: 4,
       tags: [MARKER_TAG],
-      actions,
     })
     if (!sent.ok) return null
 
@@ -962,13 +1302,15 @@ export class Bridge {
     try {
       const decision = await this.requestDecision(agent.id, {
         title: `${this.labelFor(agent.id)} · 权限请求`,
-        message: req.reason ?? `工具 ${toolName} 请求权限`,
         kind: 'approval',
         signal: req.signal,
-        buttons: [
-          { label: 'Approve', value: { approved: true } },
-          { label: 'Deny', value: { approved: false } },
-        ],
+        parts: [{
+          message: req.reason ?? `工具 ${toolName} 请求权限`,
+          buttons: [
+            { label: 'Approve', value: { approved: true } },
+            { label: 'Deny', value: { approved: false } },
+          ],
+        }],
       })
       if (decision === null) return await next()
       if (decision.approved === false) return 'rejected'
@@ -996,27 +1338,21 @@ export class Bridge {
     if (this.pref(agent.id, 'notifyOnPending') !== true || this.pref(agent.id, 'phonePriority') !== true) return await next()
 
     const questions = Array.isArray(exec.arguments?.questions) ? exec.arguments.questions : []
-    if (questions.length === 0) return await next()
+    // 没有选项的提问无法在手机上作答（只能自由输入），不进这一轮，交给 DSH 原生交互。
+    // 先滤出来是为了让「第 k/n 问」的 n 反映真正会问几道，而不是含被跳过的那些。
+    const askable = questions.filter((question) => Array.isArray(question.options) && question.options.length > 0)
+    if (askable.length === 0) return await next()
 
     try {
       const answers = []
-      for (const question of questions) {
-        const options = Array.isArray(question.options) ? question.options : []
-        // 没有选项的提问无法在手机上作答（只能自由输入），交给 DSH 原生交互。
-        if (options.length === 0) continue
-
-        // 多选没法用 ntfy 动作按钮表达（按钮是无状态的单次回执，点第二个只会多出一条回执），
-        // 因此 multi_select 一律走编号 / 标签列表作答。
+      for (const [index, question] of askable.entries()) {
+        const options = question.options
         const multi = question.multi_select === true
-        const useButtons = !multi && options.length <= MAX_ACTION_BUTTONS
-        const lines = [question.question ?? '提问']
-        options.forEach((option, index) => lines.push(`${index + 1}. ${option.label}`))
+
         const decision = await this.requestDecision(agent.id, {
           title: `${this.labelFor(agent.id)} · 提问`,
-          message: lines.join('\n'),
           kind: 'question',
-          hint: multi ? '\n\n多选：回复编号或标签，用逗号分隔，例如 1,3。' : undefined,
-          buttons: useButtons ? options.map((option) => ({ label: option.label, value: { answer: option.label } })) : undefined,
+          parts: buildQuestionParts(question, options, { index, total: askable.length }),
         })
         if (decision === null) return await next()
 
@@ -1031,8 +1367,10 @@ export class Bridge {
           continue
         }
 
-        // 单选：按钮回执直接就是标签；编号回复把数字映射回标签。
-        const label = useButtons ? options.find((option) => option.label === answer)?.label : matchOption(answer, options)
+        // 单选：编号与标签都要能还原。现在单选一律带按钮，但用户照样可能直接回
+        // 编号，所以不能再像旧实现那样「有按钮就只按标签精确匹配」——那样回
+        // 「1」会落成 custom，答案就变了味。
+        const label = matchOption(answer, options)
         answers.push(label === undefined ? { id: question.id, selected: [], custom: answer } : { id: question.id, selected: [label] })
       }
 

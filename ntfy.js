@@ -17,6 +17,28 @@ const MAX_BACKOFF_MS = 60_000
 const MAX_CATCHUP_SEC = 3_600
 
 /**
+ * ntfy 服务端 `message` 字段的硬上限（**字节**，不是字符）。
+ *
+ * 实测 ntfy.sh：4095 字节返回 200，4096 字节返回 HTTP 500（服务端 message-size-limit）。
+ * 中文一个字 3 字节，所以单条上限换算下来只有约 1365 个汉字。发布前必须按字节
+ * 分片（见 bridge.js 的 splitForNtfy），否则整条通知会被服务端拒收——而拒绝是
+ * 静默的：publish 只返回 ok:false，调用方多半是 void，用户什么都收不到。
+ *
+ * 注意 title 不占这个额度（实测 4095 字节正文 + 300 字标题仍返回 200）。
+ */
+export const NTFY_MESSAGE_MAX_BYTES = 4095
+
+/**
+ * 判断一段正文按 UTF-8 编码有多少字节。
+ *
+ * @param {string} text 正文
+ * @returns {number}
+ */
+function byteLength(text) {
+  return Buffer.byteLength(String(text ?? ''), 'utf-8')
+}
+
+/**
  * 归一化服务器地址（去掉尾部斜杠，否则拼出的 URL 会多一道斜杠）。
  *
  * @param {string} url 服务器根地址
@@ -49,17 +71,29 @@ function headersFor(server, json) {
  * 单靠 id 不可靠（见 bridge.js 的 MARKER_TAG 注释），所以消息里还会带固定标记。
  *
  * @param {{url: string, token?: string}} server 服务器描述符
- * @param {{topic: string, message: string, title?: string, priority?: number, tags?: string[], click?: string, actions?: object[]}} payload 消息内容
+ * @param {{topic: string, message: string, title?: string, priority?: number, tags?: string[], click?: string, actions?: object[], markdown?: boolean}} payload 消息内容
  * @returns {Promise<{ok: boolean, id?: string | null, status?: number, error?: string}>}
  */
 export async function publish(server, payload) {
   const url = normalizeServer(server?.url)
-  const body = { topic: payload.topic, message: payload.message }
+  const message = String(payload.message ?? '')
+  const size = byteLength(message)
+  if (size > NTFY_MESSAGE_MAX_BYTES) {
+    // 兜底防线：这是调用方的分片错误（splitForNtfy 的预算应该保证不会走到这里）。
+    // 提前拦下比发出去吃一个语焉不详的 HTTP 500 更好定位。
+    log(`ntfy: 正文 ${size} 字节超过上限 ${NTFY_MESSAGE_MAX_BYTES}，拒绝发送（分片有误）`)
+    return { ok: false, error: 'message-too-large' }
+  }
+
+  const body = { topic: payload.topic, message }
   if (payload.title !== undefined) body.title = payload.title
   if (payload.priority !== undefined) body.priority = payload.priority
   if (payload.tags !== undefined) body.tags = payload.tags
   if (payload.click !== undefined) body.click = payload.click
   if (payload.actions !== undefined) body.actions = payload.actions
+  // ntfy 默认按纯文本渲染；置 true 让客户端（安卓用 Markwon）把 markdown 渲染出来。
+  // 服务端会在发布响应里回显 content_type: text/markdown 作为确认。
+  if (payload.markdown !== undefined) body.markdown = payload.markdown
 
   try {
     const response = await fetch(url, {

@@ -220,13 +220,13 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
 /** 最近一次未展开的元素树：函数组件（CopyButton）只在展开前可见。 */
 let lastRaw = null
 /** 反复渲染到没有 setState 排队为止；hook 状态与展开顺序跨渲染保持一致。 */
-function renderFull() {
+function renderFull(sessionId = 'session-test') {
   let guard = 0
   let out = null
   do {
     dirty = false
     hookIndex = 0
-    lastRaw = header2.component({ sessionId: 'session-test' })
+    lastRaw = header2.component({ sessionId })
     out = expand(lastRaw)
   } while (dirty && guard++ < 10)
   return out
@@ -263,12 +263,27 @@ if (header2 !== null) {
     const appLinks = collect(tree2, 'a').filter((n) => n.children[0] === 'iOS' || n.children[0] === 'Android')
     check('弹窗底部有 ntfy App 下载链接（iOS + Android）', appLinks.length === 2, `实际 ${appLinks.length}`)
     check('iOS 链接指向 App Store',
-      appLinks.find((n) => n.children[0] === 'iOS')?.props.href === 'https://apps.apple.com/app/ntfy/id1625396347',
+      appLinks.find((n) => n.children[0] === 'iOS')?.props.href === 'https://apps.apple.com/cn/app/ntfy/id1625396347',
       JSON.stringify(appLinks.find((n) => n.children[0] === 'iOS')?.props.href))
     check('Android 链接指向官方 APK 直链',
       appLinks.find((n) => n.children[0] === 'Android')?.props.href
         === 'https://github.com/binwiederhier/ntfy-android/releases/download/v1.25.2/ntfy-1.25.2-play-release.apk',
       JSON.stringify(appLinks.find((n) => n.children[0] === 'Android')?.props.href))
+
+    // 二维码：编码器在宿主侧（qr.js），客户端只摆一个 <img> 指向那条路由，
+    // 因此这里断言「图存在、指向对、带 sessionId」，内容的正确性由 unit-check 钉。
+    const qrImgs = collect(tree2, 'img')
+    check('弹窗有二维码图', qrImgs.length === 1, `实际 ${qrImgs.length}`)
+    check('二维码指向宿主路由并带上 sessionId',
+      qrImgs.length === 1 && qrImgs[0].props.src === '/dsh-ntfy-remote/session/qr?sessionId=session-test',
+      JSON.stringify(qrImgs[0]?.props.src))
+    check('二维码有可访问名（alt）',
+      qrImgs.length === 1 && qrImgs[0].props.alt === '扫码添加到手机话题',
+      JSON.stringify(qrImgs[0]?.props.alt))
+    check('二维码有明确的像素尺寸（避免重排抖动）',
+      qrImgs.length === 1 && qrImgs[0].props.width === 152 && qrImgs[0].props.height === 152,
+      JSON.stringify(qrImgs[0] ? [qrImgs[0].props.width, qrImgs[0].props.height] : null))
+
     if (before !== undefined) {
       before.props.onClick()
       await tick()
@@ -305,6 +320,15 @@ if (header2 !== null) {
     check('弹窗不再显示订阅 / 回复长提示', !allText.includes('点通知即落在本话题'))
     // 取而代之的是 App 下载入口（可见标题 + 两个链接）。
     check('弹窗底部可见「ntfy App 下载地址」', allText.includes('ntfy App 下载地址：'))
+
+    // 二维码区块：可见标题 + 说明文案（深链接本身仍不落成明文）。
+    check('可见「扫码添加到手机话题」标题', allText.includes('扫码添加到手机话题'))
+    check('二维码附订阅说明', allText.includes('用手机 ntfy App 扫码即可订阅本会话话题'))
+
+    // 没话题（从没开过桥接）的会话不画二维码：否则 <img> 只会得到一个 404 破图。
+    const unboundTree = renderFull('session-unbound')
+    check('未开启桥接的会话不画二维码', collect(unboundTree, 'img').length === 0,
+      `实际 ${collect(unboundTree, 'img').length}`)
   } catch (error) {
     check('复制按钮行为验证', false, String(error && error.message ? error.message : error))
   } finally {

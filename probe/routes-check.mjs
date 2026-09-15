@@ -7,7 +7,10 @@
 // 用法：DSH_HOME=$(mktemp -d) node probe/routes-check.mjs
 
 import { Readable } from 'node:stream'
-import { Bridge } from '../bridge.js'
+import { Bridge, deepLink } from '../bridge.js'
+import { NTFY_MESSAGE_MAX_BYTES } from '../ntfy.js'
+import { topicFor } from '../topics.js'
+import { qrSvg } from '../qr.js'
 import { PREFIX, registerRoutes } from '../routes.js'
 
 let failed = 0
@@ -49,7 +52,7 @@ const config = {
     notifyOnTurnEnd: true,
     notifyOnPending: true,
     notifyOnError: true,
-    maxMessageLength: 3500,
+    maxMessageLength: 4000,
     relayTimeoutSec: 180,
     phonePriority: true,
   },
@@ -66,21 +69,25 @@ bridge.enable(SESSION, { cwd: '/tmp/dsh-ntfy-remote-routes' })
 /**
  * 调一个已注册的路由。
  *
- * @param {string} path 去掉前缀后的路径
+ * @param {string} path 去掉前缀后的路径（可带查询串）
  * @param {any} [body] JSON 请求体（GET 传 undefined）
  * @param {string} [method] HTTP 方法
- * @returns {Promise<{status: number, json: any, raw: string}>}
+ * @returns {Promise<{status: number, json: any, raw: string, headers: object}>}
  */
 async function call(path, body, method = 'POST') {
-  const handler = routes.get(PREFIX + path)
+  // 查路由表按 pathname，请求对象上的 req.url 保留查询串（二维码路由要用）。
+  const handler = routes.get(PREFIX + path.split('?')[0])
   if (handler === undefined) throw new Error(`没有注册路由 ${path}`)
   const req = Readable.from(body === undefined ? [] : [JSON.stringify(body)])
   req.method = method
+  req.url = PREFIX + path
   const chunks = []
   const res = {
     status: 0,
-    writeHead(status) {
+    headers: {},
+    writeHead(status, headers) {
       this.status = status
+      if (headers !== undefined) this.headers = headers
     },
     end(chunk) {
       if (chunk !== undefined) chunks.push(String(chunk))
@@ -94,7 +101,7 @@ async function call(path, body, method = 'POST') {
   } catch {
     json = null
   }
-  return { status: res.status, json, raw }
+  return { status: res.status, json, raw, headers: res.headers }
 }
 
 /** 本会话当前的覆盖集合。 */
@@ -111,6 +118,40 @@ check('GET / → 状态页 HTML', pageRes.status === 200 && pageRes.raw.includes
 check('会话标签用绑定的服务器名',
   statusRes.json.sessions.find((s) => s.id === SESSION)?.label === `DSH · 服务器A · ${SESSION.slice('session-'.length, 'session-'.length + 8)}`,
   JSON.stringify(statusRes.json.sessions.find((s) => s.id === SESSION)?.label))
+
+console.log('会话二维码（GET /session/qr）')
+const qrRes = await call(`/session/qr?sessionId=${SESSION}`, undefined, 'GET')
+check('已绑定会话 → 200', qrRes.status === 200, String(qrRes.status))
+check('Content-Type 是 image/svg+xml',
+  String(qrRes.headers['Content-Type'] ?? '').startsWith('image/svg+xml'), JSON.stringify(qrRes.headers))
+check('正文是自包含 SVG',
+  qrRes.raw.startsWith('<svg xmlns="http://www.w3.org/2000/svg"') && qrRes.raw.endsWith('</svg>'),
+  qrRes.raw.slice(0, 60))
+// 二维码里只有模块坐标，深链接不能以明文落进响应体。
+check('响应体不含明文深链接', !qrRes.raw.includes('ntfy://'))
+// 路由要真的按 sessionId 解出「服务器 + 话题」：与直接算出来的期望值逐字节一致。
+check('二维码内容 = 本会话的 ntfy:// 深链接',
+  qrRes.raw === qrSvg(deepLink('https://ntfy.sh', topicFor(SESSION))),
+  '与期望 SVG 不一致')
+const qrNoId = await call('/session/qr', undefined, 'GET')
+check('缺 sessionId → 404 no-topic',
+  qrNoId.status === 404 && qrNoId.json?.error === 'no-topic', `${qrNoId.status} ${JSON.stringify(qrNoId.json)}`)
+const qrUnknown = await call('/session/qr?sessionId=session-not-recorded-0000-0000-000000000000', undefined, 'GET')
+check('没有记录的会话 → 404 no-topic',
+  qrUnknown.status === 404 && qrUnknown.json?.error === 'no-topic', `${qrUnknown.status} ${JSON.stringify(qrUnknown.json)}`)
+
+// 状态页的 <script> 是**原样**发给浏览器的：Node 模块作用域的常量在里面根本不存在，
+// 一旦把宿主常量拼进去，render() 会在那一行抛 ReferenceError，整段「全局默认」
+// 静默渲染不出来——而路由本身仍然 200，所以只看状态码的测试完全发现不了。
+console.log('状态页内联脚本：不得引用宿主侧常量')
+const page = await call('', undefined, 'GET')
+check('状态页返回 HTML 骨架', page.raw.includes('<script>') && page.raw.includes('id="app"'))
+const leaked = page.raw.match(/NTFY_[A-Z_]+/g) ?? []
+check('没有把宿主常量泄漏进浏览器脚本', leaked.length === 0, `命中：${leaked.join(', ')}`)
+check('浏览器脚本自带单条上限常量', page.raw.includes('const MAX_MESSAGE_BYTES = 4095'))
+check('单条上限输入框引用的是浏览器侧常量',
+  page.raw.includes('max="\' + MAX_MESSAGE_BYTES + \'"'),
+  '输入框没有引用 MAX_MESSAGE_BYTES')
 
 console.log('参数校验（都应被拒绝，且不落盘）')
 const rejections = [
@@ -162,9 +203,14 @@ res = await call('/server/delete', { id: 'srv_a' })
 check('只剩一个服务器 → 409 last-server', res.status === 409 && res.json.error === 'last-server', JSON.stringify(res.json))
 await call('/config', { relayTimeoutSec: 3, maxMessageLength: 50 })
 check('全局超时 <5 被忽略', config.defaults.relayTimeoutSec === 180, String(config.defaults.relayTimeoutSec))
-check('全局正文上限 <100 被忽略', config.defaults.maxMessageLength === 3500, String(config.defaults.maxMessageLength))
+check('全局正文上限 <100 被忽略', config.defaults.maxMessageLength === 4000, String(config.defaults.maxMessageLength))
 await call('/config', { relayTimeoutSec: 45, maxMessageLength: 500 })
 check('全局超时 45 / 正文上限 500 生效', config.defaults.relayTimeoutSec === 45 && config.defaults.maxMessageLength === 500)
+// 超过 ntfy 硬上限必须被钳住：否则分片预算贴着 4096，服务端会整条拒收（HTTP 500）。
+await call('/config', { maxMessageLength: 999999 })
+check('正文上限超过 ntfy 硬上限被钳住',
+  config.defaults.maxMessageLength === NTFY_MESSAGE_MAX_BYTES,
+  String(config.defaults.maxMessageLength))
 
 console.log('「删除记录」（forget）：只删插件里的记录，不动 DSH 会话')
 res = await call('/session/forget', {})

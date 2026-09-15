@@ -2,6 +2,7 @@
 //
 //   GET  /dsh-ntfy-remote                自包含状态页（无框架、无构建）
 //   GET  /dsh-ntfy-remote/status         状态 JSON
+//   GET  /dsh-ntfy-remote/session/qr     ?sessionId=… 该会话话题的二维码（SVG）
 //   POST /dsh-ntfy-remote/toggle         { sessionId, enabled, serverId? }
 //   POST /dsh-ntfy-remote/session/prefs  { sessionId, key, value }   value=null 表示恢复默认；
 //                                        值按 key 校验类型/范围，与全局默认一致时等同于恢复默认
@@ -18,7 +19,9 @@ const VERSION = new URL(import.meta.url).search
 const { describeError, log } = await import(`./log.js${VERSION}`)
 const { PREF_KEYS, newServerId, normalizeServer, saveConfig } = await import(`./config.js${VERSION}`)
 const { deepLink } = await import(`./bridge.js${VERSION}`)
+const { NTFY_MESSAGE_MAX_BYTES } = await import(`./ntfy.js${VERSION}`)
 const { topicUrl } = await import(`./topics.js${VERSION}`)
+const { qrSvg } = await import(`./qr.js${VERSION}`)
 
 /** 路由前缀。 */
 export const PREFIX = '/dsh-ntfy-remote'
@@ -125,6 +128,23 @@ function snapshot(ctx, bridge) {
 }
 
 /**
+ * 会话话题的 `ntfy://` 深链接；未绑定、服务器已删除或还没有话题时返回 null。
+ *
+ * 与 `snapshot()` 里那个 `deepLink` 字段同一套判定，二维码路由复用它，避免两处
+ * 各写一遍「什么时候算可订阅」。
+ *
+ * @param {import('./bridge.js').Bridge} bridge 桥接实例
+ * @param {string} sessionId 会话 id
+ * @returns {string | null}
+ */
+function sessionDeepLink(bridge, sessionId) {
+  const topic = bridge.state.sessions[sessionId]?.topic ?? null
+  const server = bridge.serverFor(sessionId)
+  if (topic === null || server === null) return null
+  return deepLink(server.url, topic)
+}
+
+/**
  * 注册全部路由。
  *
  * @param {object} ctx cordis 上下文
@@ -160,6 +180,22 @@ export function registerRoutes(ctx, bridge) {
     } catch (error) {
       sendJson(res, 500, { ok: false, error: describeError(error) })
     }
+  })
+
+  // 会话话题的二维码：`<img>` 直接引用，内容就是 `ntfy://服务器/话题`，手机扫码即订阅。
+  // 只认 sessionId、不认任意文本——否则这个端点就成了「把任何东西渲染成二维码」的公开
+  // 工具，既没必要也容易被拿去当跳板。
+  route('/session/qr', (req, res) => {
+    const sessionId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('sessionId') ?? ''
+    const link = sessionId === '' ? null : sessionDeepLink(bridge, sessionId)
+    const svg = link === null ? null : qrSvg(link)
+    if (svg === null) {
+      // 链接本身来自我们自己的数据，超长只可能是配置出了怪服务器地址，按 500 报。
+      if (link === null) return sendJson(res, 404, { ok: false, error: 'no-topic' })
+      return sendJson(res, 500, { ok: false, error: 'qr-encode-failed' })
+    }
+    res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'no-store' })
+    res.end(svg)
   })
 
   post('/toggle', async (body) => {
@@ -271,7 +307,10 @@ export function registerRoutes(ctx, bridge) {
       if (typeof body[key] === 'boolean') config.defaults[key] = body[key]
     }
     if (Number.isFinite(body.relayTimeoutSec) && body.relayTimeoutSec >= 5) config.defaults.relayTimeoutSec = Math.floor(body.relayTimeoutSec)
-    if (Number.isFinite(body.maxMessageLength) && body.maxMessageLength >= 100) config.defaults.maxMessageLength = Math.floor(body.maxMessageLength)
+    // 单条正文的字节预算：下限 100（再小就切得太碎），上限钳到 ntfy 的硬上限。
+    if (Number.isFinite(body.maxMessageLength) && body.maxMessageLength >= 100) {
+      config.defaults.maxMessageLength = Math.min(Math.floor(body.maxMessageLength), NTFY_MESSAGE_MAX_BYTES)
+    }
     if (typeof body.defaultServerId === 'string' && config.servers.some((s) => s.id === body.defaultServerId)) {
       config.defaultServerId = body.defaultServerId
     }
@@ -334,6 +373,12 @@ function statusPage() {
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))
 // 「作答超时」(relayTimeoutSec) 是什么：会话偏好与全局默认两处共用一句说明。
 const TIMEOUT_HINT = '作答超时：审批 / 提问推到手机后，最多等这么久你的回复；超时自动回落 DSH 原生交互，本地弹窗继续等，请求不会丢。出厂默认 180 秒。'
+// ntfy 单条 message 的字节硬上限。宿主侧 ntfy.js 导出的同名常量才是权威值，但这段脚本
+// 跑在**浏览器**里，看不到 Node 模块作用域的标识符——直接引用宿主常量会抛 ReferenceError，
+// 让整段「全局默认」渲染不出来。所以这里必须自带一份字面量。
+const MAX_MESSAGE_BYTES = 4095
+// 「单条上限」说明：单位是字节不是字，且超限是拆条而不是截断。
+const MAX_MESSAGE_HINT = '单条推送正文的字节上限（一个汉字约 3 字节）。超出会拆成多条继续发，内容不会丢；ntfy 硬上限 4095 字节，出厂默认 4000。'
 // 复制话题名：优先 async clipboard（localhost / https 是安全上下文），局域网明文 http
 // 不是安全上下文，退回隐藏 textarea + execCommand。
 async function copyText(text) {
@@ -560,7 +605,7 @@ async function render() {
     '<label><input type="checkbox" id="d-error" ' + (d.notifyOnError ? 'checked' : '') + '> 错误/中断推送</label>' +
     '<label><input type="checkbox" id="d-phone" ' + (d.phonePriority ? 'checked' : '') + '> 手机优先接管作答</label></div>' +
     '<div class="row">作答超时 <input id="d-timeout" type="number" min="5" value="' + d.relayTimeoutSec + '" style="width:90px" title="' + esc(TIMEOUT_HINT) + '"> 秒' +
-    ' 正文上限 <input id="d-max" type="number" min="100" value="' + d.maxMessageLength + '" style="width:110px" title="推送到手机的正文最多截断到这么多字。"> 字</div>' +
+    ' 单条上限 <input id="d-max" type="number" min="100" max="' + MAX_MESSAGE_BYTES + '" value="' + d.maxMessageLength + '" style="width:110px" title="' + MAX_MESSAGE_HINT + '"> 字节</div>' +
     '<div class="muted" style="font-size:11px;line-height:1.5">' + esc(TIMEOUT_HINT) + '</div>' +
     '<div class="row"><button id="d-save">保存默认</button></div>')
   document.getElementById('d-save').onclick = async () => {
